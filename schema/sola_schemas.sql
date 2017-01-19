@@ -1,12 +1,17 @@
 --
 -- PostgreSQL database dump
 --
- 
+
+-- Dumped from database version 9.5.3
+-- Dumped by pg_dump version 9.5.5
+
 SET statement_timeout = 0;
+SET lock_timeout = 0;
 SET client_encoding = 'UTF8';
 SET standard_conforming_strings = on;
 SET check_function_bodies = false;
 SET client_min_messages = warning;
+SET row_security = off;
 
 --
 -- Name: address; Type: SCHEMA; Schema: -; Owner: postgres
@@ -55,21 +60,6 @@ ALTER SCHEMA application OWNER TO postgres;
 
 COMMENT ON SCHEMA application IS 'Extension to the LADM used by SOLA to implement Case Management functionality.';
 
-
---
--- Name: bulk_operation; Type: SCHEMA; Schema: -; Owner: postgres
---
-
-CREATE SCHEMA bulk_operation;
-
-
-ALTER SCHEMA bulk_operation OWNER TO postgres;
-
---
--- Name: SCHEMA bulk_operation; Type: COMMENT; Schema: -; Owner: postgres
---
-
-COMMENT ON SCHEMA bulk_operation IS 'Extension to the LADM used by SOLA to implement Bulk Operation functionality such as loading of shapefiles and documents.';
 
 --
 -- Name: cadastre; Type: SCHEMA; Schema: -; Owner: postgres
@@ -2946,254 +2936,6 @@ ALTER FUNCTION application.getlodgetiming(fromdate date, todate date) OWNER TO p
 COMMENT ON FUNCTION getlodgetiming(fromdate date, todate date) IS 'Not used. Replaced by get_work_summary.';
 
 
-
-SET search_path = bulk_operation, pg_catalog;
-
---
--- Name: clean_after_rollback(); Type: FUNCTION; Schema: bulk_operation; Owner: postgres
---
-
-CREATE FUNCTION clean_after_rollback() RETURNS void
-    LANGUAGE plpgsql
-    AS $$
-declare
-  rec record;
-begin
-  for rec in select id from cadastre.level 
-    where id != 'cadastreObject' and id not in (select level_id from cadastre.spatial_unit) loop
-    delete from cadastre.level where id = rec.id;
-    delete from system.config_map_layer where added_from_bulk_operation and name = rec.id;
-  end loop;
-end;
-$$;
-
-
-ALTER FUNCTION bulk_operation.clean_after_rollback() OWNER TO postgres;
-
---
--- Name: FUNCTION clean_after_rollback(); Type: COMMENT; Schema: bulk_operation; Owner: postgres
---
-
-COMMENT ON FUNCTION clean_after_rollback() IS 'Runs clean up tasks after the transaction of bulk operation is rolled back.';
-
-
---
--- Name: move_cadastre_objects(character varying, character varying); Type: FUNCTION; Schema: bulk_operation; Owner: postgres
---
-
-CREATE FUNCTION move_cadastre_objects(transaction_id_v character varying, change_user_v character varying) RETURNS void
-    LANGUAGE plpgsql
-    AS $_$
-declare
-  generate_name_first_part boolean;
-  rec record;
-  rec2 record;
-  last_part varchar;
-  first_part_counter integer;
-  first_part  varchar;
-  tmp_value integer;
-  duplicate_seperator varchar;
-  status varchar;
-  geom_v geometry;
-  tolerance double precision;
-  survey_point_counter integer;
-  transaction_has_pending boolean;
-begin
-  transaction_has_pending = false;
-  duplicate_seperator = ' / ';
-  tolerance = system.get_setting('map-tolerance')::double precision;
-  generate_name_first_part = (select bulk_generate_first_part 
-    from transaction.transaction 
-    where id = transaction_id_v);
-  first_part_counter = 1;
-  for rec in select id, transaction_id, cadastre_object_type_code, name_firstpart, name_lastpart, geom, official_area
-    from bulk_operation.spatial_unit_temporary where transaction_id = transaction_id_v loop
-      status = 'current';
-      if last_part is null then
-        last_part = rec.name_lastpart;
-        if generate_name_first_part then
-          first_part_counter = (select coalesce(max(name_firstpart::integer), 0) 
-            from cadastre.cadastre_object 
-            where name_firstpart ~ '^[0-9]+$' and name_lastpart = last_part);
-          first_part_counter = first_part_counter + 1;
-        end if;
-      end if;
-      if not generate_name_first_part then
-        first_part = rec.name_firstpart;
-        -- It means the unicity of the cadastre object name is not garanteed so it has to be checked.
-        -- Check first if the combination first_part, last_part is found in the cadastre_object table
-        tmp_value = (select count(1)
-          from cadastre.cadastre_object 
-          where name_lastpart = last_part 
-            and (name_firstpart = first_part
-              or name_firstpart like first_part || duplicate_seperator || '%'));
-        if tmp_value > 0 then
-          tmp_value = tmp_value + 1;
-          first_part = first_part || duplicate_seperator || tmp_value::varchar;
-          status = 'pending';
-        end if;
-      else
-        first_part = first_part_counter::varchar;
-        first_part_counter = first_part_counter + 1;
-      end if;
-      geom_v = rec.geom;
-      if st_isvalid(geom_v) and st_geometrytype(geom_v) = 'ST_Polygon' then
-        if (select count(1) 
-          from cadastre.cadastre_object 
-          where geom_polygon && geom_v 
-            and st_intersects(geom_polygon, st_buffer(geom_v, - tolerance))) > 0 then
-          status = 'pending';
-        end if;
-        insert into cadastre.cadastre_object(id, type_code, status_code, transaction_id, name_firstpart, name_lastpart, geom_polygon, change_user)
-        values(rec.id, rec.cadastre_object_type_code, status, transaction_id_v, first_part, last_part, geom_v, change_user_v);
-        insert into cadastre.spatial_value_area(spatial_unit_id, type_code, size, change_user)
-        values(rec.id, 'officialArea', coalesce(rec.official_area, st_area(geom_v)), change_user_v);
-        insert into cadastre.spatial_value_area(spatial_unit_id, type_code, size, change_user)
-        values(rec.id, 'calculatedArea', st_area(geom_v), change_user_v);
-      else
-        status = 'pending'; 
-      end if;
-      if status = 'pending' then
-        transaction_has_pending = true;
-        survey_point_counter = (select count(1) + 1 from cadastre.survey_point where transaction_id = transaction_id_v);
-        for rec2 in select distinct geom from st_dumppoints(geom_v) loop
-          insert into cadastre.survey_point(transaction_id, id, geom, original_geom, change_user)
-          values(transaction_id_v, survey_point_counter::varchar, rec2.geom, rec2.geom, change_user_v);
-          survey_point_counter = survey_point_counter + 1;
-        end loop;
-      end if;
-    end loop;
-    if not transaction_has_pending then
-      update transaction.transaction set status_code = 'approved', change_user = change_user_v where id = transaction_id_v;
-    end if;
-    delete from bulk_operation.spatial_unit_temporary where transaction_id = transaction_id_v;
-end;
-$_$;
-
-
-ALTER FUNCTION bulk_operation.move_cadastre_objects(transaction_id_v character varying, change_user_v character varying) OWNER TO postgres;
-
---
--- Name: FUNCTION move_cadastre_objects(transaction_id_v character varying, change_user_v character varying); Type: COMMENT; Schema: bulk_operation; Owner: postgres
---
-
-COMMENT ON FUNCTION move_cadastre_objects(transaction_id_v character varying, change_user_v character varying) IS 'Moves cadastre objects from the Bulk Operation schema to the Cadastre schema.';
-
-
---
--- Name: move_other_objects(character varying, character varying); Type: FUNCTION; Schema: bulk_operation; Owner: postgres
---
-
-CREATE FUNCTION move_other_objects(transaction_id_v character varying, change_user_v character varying) RETURNS void
-    LANGUAGE plpgsql
-    AS $$
-declare
-  other_object_type varchar;
-  level_id_v varchar;
-  geometry_type varchar;
-  geometry_type_for_structure varchar;
-  query_name_v varchar;
-  query_sql_template varchar;
-begin
-  query_sql_template = 'select id, label, st_asewkb(st_transform(geom, #{srid})) as the_geom from cadastre.spatial_unit 
-where level_id = ''level_id_v'' and ST_Intersects(st_transform(geom, #{srid}), ST_SetSRID(ST_3DMakeBox(ST_Point(#{minx}, #{miny}),ST_Point(#{maxx}, #{maxy})), #{srid}))';
-  other_object_type = (select type_code 
-    from bulk_operation.spatial_unit_temporary 
-    where transaction_id = transaction_id_v limit 1);
-  geometry_type = (select st_geometrytype(geom) 
-    from bulk_operation.spatial_unit_temporary 
-    where transaction_id = transaction_id_v limit 1);
-  geometry_type = lower(substring(geometry_type from 4));
-  if (select count(*) from cadastre.structure_type where code = geometry_type) = 0 then
-    insert into cadastre.structure_type(code, display_value, status)
-    values(geometry_type, geometry_type, 'c');
-  end if;
-  level_id_v = (select id from cadastre.level where name = other_object_type or id = lower(other_object_type));
-  if level_id_v is null then
-    level_id_v = lower(other_object_type);
-    insert into cadastre.level(id, type_code, name, structure_code, editable) 
-    values(level_id_v, 'geographicLocator', other_object_type, geometry_type, true);
-    if (select count(*) from system.config_map_layer where name = level_id_v) = 0 then
-      -- A map layer is added here. For the symbology an sld file already predefined in gis component must be used.
-      -- The sld file must be named after the geometry type + the word generic. 
-      query_name_v = 'SpatialResult.get' || level_id_v;
-      if (select count(*) from system.query where name = query_name_v) = 0 then
-        -- A query is added here
-        insert into system.query(name, sql) values(query_name_v, replace(query_sql_template, 'level_id_v', level_id_v));
-      end if;
-      if geometry_type like '%point' then
-        geometry_type_for_structure = replace(geometry_type, 'point', 'Point');
-      elseif geometry_type like '%linestring' then
-        geometry_type_for_structure = replace(geometry_type, 'linestring', 'LineString');
-      elseif geometry_type like '%polygon' then
-        geometry_type_for_structure = replace(geometry_type, 'polygon', 'Polygon');
-      else
-        geometry_type_for_structure = 'Geometry';
-      end if;
-      geometry_type_for_structure  = replace(geometry_type_for_structure, 'multi', 'Multi');
-      
-      insert into system.config_map_layer(name, title, type_code, active, visible_in_start, item_order, style, pojo_structure, pojo_query_name, added_from_bulk_operation) 
-      values(level_id_v, other_object_type, 'pojo', true, true, 1, 'generic-' || geometry_type || '.xml', 'theGeom:' || geometry_type_for_structure || ',label:""', query_name_v, true);
-    end if;
-  end if;
-  insert into cadastre.spatial_unit(id, label, level_id, geom, transaction_id, change_user)
-  select id, label, level_id_v, geom, transaction_id, change_user_v
-  from bulk_operation.spatial_unit_temporary where transaction_id = transaction_id_v;
-  update transaction.transaction set status_code = 'approved', change_user = change_user_v where id = transaction_id_v;
-  delete from bulk_operation.spatial_unit_temporary where transaction_id = transaction_id_v;
-end;
-$$;
-
-
-ALTER FUNCTION bulk_operation.move_other_objects(transaction_id_v character varying, change_user_v character varying) OWNER TO postgres;
-
---
--- Name: FUNCTION move_other_objects(transaction_id_v character varying, change_user_v character varying); Type: COMMENT; Schema: bulk_operation; Owner: postgres
---
-
-COMMENT ON FUNCTION move_other_objects(transaction_id_v character varying, change_user_v character varying) IS 'Moves general spatial objects other than cadastre objects from the Bulk Operation schema to the Cadastre schema. If an appropriate level and/or structure type do not exist in the Cadastre schema, this function will add them.';
-
-
---
--- Name: move_spatial_units(character varying, character varying); Type: FUNCTION; Schema: bulk_operation; Owner: postgres
---
-
-CREATE FUNCTION move_spatial_units(transaction_id_v character varying, change_user_v character varying) RETURNS void
-    LANGUAGE plpgsql
-    AS $$
-declare
-  spatial_unit_type varchar;
-begin
-  spatial_unit_type = (select type_code 
-    from bulk_operation.spatial_unit_temporary 
-    where transaction_id = transaction_id_v limit 1);
-  if spatial_unit_type is null then
-    return;
-  end if;
-  if spatial_unit_type = 'cadastre_object' then
-    execute bulk_operation.move_cadastre_objects(transaction_id_v, change_user_v);
-  else
-    execute bulk_operation.move_other_objects(transaction_id_v, change_user_v);
-  end if;
-end;
-$$;
-
-
-ALTER FUNCTION bulk_operation.move_spatial_units(transaction_id_v character varying, change_user_v character varying) OWNER TO postgres;
-
---
--- Name: FUNCTION move_spatial_units(transaction_id_v character varying, change_user_v character varying); Type: COMMENT; Schema: bulk_operation; Owner: postgres
---
-
-COMMENT ON FUNCTION move_spatial_units(transaction_id_v character varying, change_user_v character varying) IS 'Moves all spatial data from teh Bulk Operation schema to the Cadastre schema using the move_cadastre_objects and move_other_objects functions. This function is called after the bulk opearation transaction is created by the Bulk Operation application';
-
-
-
-
-
-
-
-
 SET search_path = cadastre, pg_catalog;
 
 --
@@ -4226,7 +3968,7 @@ SET default_tablespace = '';
 SET default_with_oids = false;
 
 --
--- Name: address; Type: TABLE; Schema: address; Owner: postgres; Tablespace: 
+-- Name: address; Type: TABLE; Schema: address; Owner: postgres
 --
 
 CREATE TABLE address (
@@ -4241,7 +3983,7 @@ CREATE TABLE address (
 );
 
 
-ALTER TABLE address.address OWNER TO postgres;
+ALTER TABLE address OWNER TO postgres;
 
 --
 -- Name: TABLE address; Type: COMMENT; Schema: address; Owner: postgres
@@ -4308,7 +4050,7 @@ COMMENT ON COLUMN address.change_time IS 'The date and time the row was last mod
 
 
 --
--- Name: address_historic; Type: TABLE; Schema: address; Owner: postgres; Tablespace: 
+-- Name: address_historic; Type: TABLE; Schema: address; Owner: postgres
 --
 
 CREATE TABLE address_historic (
@@ -4324,12 +4066,12 @@ CREATE TABLE address_historic (
 );
 
 
-ALTER TABLE address.address_historic OWNER TO postgres;
+ALTER TABLE address_historic OWNER TO postgres;
 
 SET search_path = administrative, pg_catalog;
 
 --
--- Name: ba_unit; Type: TABLE; Schema: administrative; Owner: postgres; Tablespace: 
+-- Name: ba_unit; Type: TABLE; Schema: administrative; Owner: postgres
 --
 
 CREATE TABLE ba_unit (
@@ -4352,7 +4094,7 @@ CREATE TABLE ba_unit (
 );
 
 
-ALTER TABLE administrative.ba_unit OWNER TO postgres;
+ALTER TABLE ba_unit OWNER TO postgres;
 
 --
 -- Name: TABLE ba_unit; Type: COMMENT; Schema: administrative; Owner: postgres
@@ -4475,7 +4217,7 @@ COMMENT ON COLUMN ba_unit.redact_code IS 'FROM  SOLA State Land Extension: The r
 
 
 --
--- Name: ba_unit_area; Type: TABLE; Schema: administrative; Owner: postgres; Tablespace: 
+-- Name: ba_unit_area; Type: TABLE; Schema: administrative; Owner: postgres
 --
 
 CREATE TABLE ba_unit_area (
@@ -4491,7 +4233,7 @@ CREATE TABLE ba_unit_area (
 );
 
 
-ALTER TABLE administrative.ba_unit_area OWNER TO postgres;
+ALTER TABLE ba_unit_area OWNER TO postgres;
 
 --
 -- Name: TABLE ba_unit_area; Type: COMMENT; Schema: administrative; Owner: postgres
@@ -4565,7 +4307,7 @@ COMMENT ON COLUMN ba_unit_area.change_time IS 'The date and time the row was las
 
 
 --
--- Name: ba_unit_area_historic; Type: TABLE; Schema: administrative; Owner: postgres; Tablespace: 
+-- Name: ba_unit_area_historic; Type: TABLE; Schema: administrative; Owner: postgres
 --
 
 CREATE TABLE ba_unit_area_historic (
@@ -4582,10 +4324,10 @@ CREATE TABLE ba_unit_area_historic (
 );
 
 
-ALTER TABLE administrative.ba_unit_area_historic OWNER TO postgres;
+ALTER TABLE ba_unit_area_historic OWNER TO postgres;
 
 --
--- Name: ba_unit_as_party; Type: TABLE; Schema: administrative; Owner: postgres; Tablespace: 
+-- Name: ba_unit_as_party; Type: TABLE; Schema: administrative; Owner: postgres
 --
 
 CREATE TABLE ba_unit_as_party (
@@ -4595,7 +4337,7 @@ CREATE TABLE ba_unit_as_party (
 );
 
 
-ALTER TABLE administrative.ba_unit_as_party OWNER TO postgres;
+ALTER TABLE ba_unit_as_party OWNER TO postgres;
 
 --
 -- Name: TABLE ba_unit_as_party; Type: COMMENT; Schema: administrative; Owner: postgres
@@ -4627,7 +4369,7 @@ COMMENT ON COLUMN ba_unit_as_party.rowidentifier IS 'SOLA Extension: Identifies 
 
 
 --
--- Name: ba_unit_contains_spatial_unit; Type: TABLE; Schema: administrative; Owner: postgres; Tablespace: 
+-- Name: ba_unit_contains_spatial_unit; Type: TABLE; Schema: administrative; Owner: postgres
 --
 
 CREATE TABLE ba_unit_contains_spatial_unit (
@@ -4641,7 +4383,7 @@ CREATE TABLE ba_unit_contains_spatial_unit (
 );
 
 
-ALTER TABLE administrative.ba_unit_contains_spatial_unit OWNER TO postgres;
+ALTER TABLE ba_unit_contains_spatial_unit OWNER TO postgres;
 
 --
 -- Name: TABLE ba_unit_contains_spatial_unit; Type: COMMENT; Schema: administrative; Owner: postgres
@@ -4701,7 +4443,7 @@ COMMENT ON COLUMN ba_unit_contains_spatial_unit.change_time IS 'The date and tim
 
 
 --
--- Name: ba_unit_contains_spatial_unit_historic; Type: TABLE; Schema: administrative; Owner: postgres; Tablespace: 
+-- Name: ba_unit_contains_spatial_unit_historic; Type: TABLE; Schema: administrative; Owner: postgres
 --
 
 CREATE TABLE ba_unit_contains_spatial_unit_historic (
@@ -4716,7 +4458,7 @@ CREATE TABLE ba_unit_contains_spatial_unit_historic (
 );
 
 
-ALTER TABLE administrative.ba_unit_contains_spatial_unit_historic OWNER TO postgres;
+ALTER TABLE ba_unit_contains_spatial_unit_historic OWNER TO postgres;
 
 --
 -- Name: ba_unit_first_name_part_seq; Type: SEQUENCE; Schema: administrative; Owner: postgres
@@ -4731,7 +4473,7 @@ CREATE SEQUENCE ba_unit_first_name_part_seq
     CYCLE;
 
 
-ALTER TABLE administrative.ba_unit_first_name_part_seq OWNER TO postgres;
+ALTER TABLE ba_unit_first_name_part_seq OWNER TO postgres;
 
 --
 -- Name: SEQUENCE ba_unit_first_name_part_seq; Type: COMMENT; Schema: administrative; Owner: postgres
@@ -4741,7 +4483,7 @@ COMMENT ON SEQUENCE ba_unit_first_name_part_seq IS 'Sequence number used as the 
 
 
 --
--- Name: ba_unit_historic; Type: TABLE; Schema: administrative; Owner: postgres; Tablespace: 
+-- Name: ba_unit_historic; Type: TABLE; Schema: administrative; Owner: postgres
 --
 
 CREATE TABLE ba_unit_historic (
@@ -4765,7 +4507,7 @@ CREATE TABLE ba_unit_historic (
 );
 
 
-ALTER TABLE administrative.ba_unit_historic OWNER TO postgres;
+ALTER TABLE ba_unit_historic OWNER TO postgres;
 
 --
 -- Name: ba_unit_last_name_part_seq; Type: SEQUENCE; Schema: administrative; Owner: postgres
@@ -4780,7 +4522,7 @@ CREATE SEQUENCE ba_unit_last_name_part_seq
     CYCLE;
 
 
-ALTER TABLE administrative.ba_unit_last_name_part_seq OWNER TO postgres;
+ALTER TABLE ba_unit_last_name_part_seq OWNER TO postgres;
 
 --
 -- Name: SEQUENCE ba_unit_last_name_part_seq; Type: COMMENT; Schema: administrative; Owner: postgres
@@ -4790,7 +4532,7 @@ COMMENT ON SEQUENCE ba_unit_last_name_part_seq IS 'Sequence number used as the b
 
 
 --
--- Name: ba_unit_rel_type; Type: TABLE; Schema: administrative; Owner: postgres; Tablespace: 
+-- Name: ba_unit_rel_type; Type: TABLE; Schema: administrative; Owner: postgres
 --
 
 CREATE TABLE ba_unit_rel_type (
@@ -4801,7 +4543,7 @@ CREATE TABLE ba_unit_rel_type (
 );
 
 
-ALTER TABLE administrative.ba_unit_rel_type OWNER TO postgres;
+ALTER TABLE ba_unit_rel_type OWNER TO postgres;
 
 --
 -- Name: TABLE ba_unit_rel_type; Type: COMMENT; Schema: administrative; Owner: postgres
@@ -4840,7 +4582,7 @@ COMMENT ON COLUMN ba_unit_rel_type.status IS 'Status of the relationship type.';
 
 
 --
--- Name: ba_unit_target; Type: TABLE; Schema: administrative; Owner: postgres; Tablespace: 
+-- Name: ba_unit_target; Type: TABLE; Schema: administrative; Owner: postgres
 --
 
 CREATE TABLE ba_unit_target (
@@ -4854,7 +4596,7 @@ CREATE TABLE ba_unit_target (
 );
 
 
-ALTER TABLE administrative.ba_unit_target OWNER TO postgres;
+ALTER TABLE ba_unit_target OWNER TO postgres;
 
 --
 -- Name: TABLE ba_unit_target; Type: COMMENT; Schema: administrative; Owner: postgres
@@ -4914,7 +4656,7 @@ COMMENT ON COLUMN ba_unit_target.change_time IS 'The date and time the row was l
 
 
 --
--- Name: ba_unit_target_historic; Type: TABLE; Schema: administrative; Owner: postgres; Tablespace: 
+-- Name: ba_unit_target_historic; Type: TABLE; Schema: administrative; Owner: postgres
 --
 
 CREATE TABLE ba_unit_target_historic (
@@ -4929,10 +4671,10 @@ CREATE TABLE ba_unit_target_historic (
 );
 
 
-ALTER TABLE administrative.ba_unit_target_historic OWNER TO postgres;
+ALTER TABLE ba_unit_target_historic OWNER TO postgres;
 
 --
--- Name: ba_unit_type; Type: TABLE; Schema: administrative; Owner: postgres; Tablespace: 
+-- Name: ba_unit_type; Type: TABLE; Schema: administrative; Owner: postgres
 --
 
 CREATE TABLE ba_unit_type (
@@ -4943,7 +4685,7 @@ CREATE TABLE ba_unit_type (
 );
 
 
-ALTER TABLE administrative.ba_unit_type OWNER TO postgres;
+ALTER TABLE ba_unit_type OWNER TO postgres;
 
 --
 -- Name: TABLE ba_unit_type; Type: COMMENT; Schema: administrative; Owner: postgres
@@ -4982,7 +4724,7 @@ COMMENT ON COLUMN ba_unit_type.status IS 'SOLA Extension: Status of the BA Unit 
 
 
 --
--- Name: condition_for_rrr; Type: TABLE; Schema: administrative; Owner: postgres; Tablespace: 
+-- Name: condition_for_rrr; Type: TABLE; Schema: administrative; Owner: postgres
 --
 
 CREATE TABLE condition_for_rrr (
@@ -5000,7 +4742,7 @@ CREATE TABLE condition_for_rrr (
 );
 
 
-ALTER TABLE administrative.condition_for_rrr OWNER TO postgres;
+ALTER TABLE condition_for_rrr OWNER TO postgres;
 
 --
 -- Name: TABLE condition_for_rrr; Type: COMMENT; Schema: administrative; Owner: postgres
@@ -5088,7 +4830,7 @@ COMMENT ON COLUMN condition_for_rrr.change_time IS 'The date and time the row wa
 
 
 --
--- Name: condition_for_rrr_historic; Type: TABLE; Schema: administrative; Owner: postgres; Tablespace: 
+-- Name: condition_for_rrr_historic; Type: TABLE; Schema: administrative; Owner: postgres
 --
 
 CREATE TABLE condition_for_rrr_historic (
@@ -5107,10 +4849,10 @@ CREATE TABLE condition_for_rrr_historic (
 );
 
 
-ALTER TABLE administrative.condition_for_rrr_historic OWNER TO postgres;
+ALTER TABLE condition_for_rrr_historic OWNER TO postgres;
 
 --
--- Name: condition_type; Type: TABLE; Schema: administrative; Owner: postgres; Tablespace: 
+-- Name: condition_type; Type: TABLE; Schema: administrative; Owner: postgres
 --
 
 CREATE TABLE condition_type (
@@ -5121,7 +4863,7 @@ CREATE TABLE condition_type (
 );
 
 
-ALTER TABLE administrative.condition_type OWNER TO postgres;
+ALTER TABLE condition_type OWNER TO postgres;
 
 --
 -- Name: TABLE condition_type; Type: COMMENT; Schema: administrative; Owner: postgres
@@ -5160,7 +4902,7 @@ COMMENT ON COLUMN condition_type.status IS 'Status of the condition type.';
 
 
 --
--- Name: mortgage_isbased_in_rrr; Type: TABLE; Schema: administrative; Owner: postgres; Tablespace: 
+-- Name: mortgage_isbased_in_rrr; Type: TABLE; Schema: administrative; Owner: postgres
 --
 
 CREATE TABLE mortgage_isbased_in_rrr (
@@ -5174,7 +4916,7 @@ CREATE TABLE mortgage_isbased_in_rrr (
 );
 
 
-ALTER TABLE administrative.mortgage_isbased_in_rrr OWNER TO postgres;
+ALTER TABLE mortgage_isbased_in_rrr OWNER TO postgres;
 
 --
 -- Name: TABLE mortgage_isbased_in_rrr; Type: COMMENT; Schema: administrative; Owner: postgres
@@ -5234,7 +4976,7 @@ COMMENT ON COLUMN mortgage_isbased_in_rrr.change_time IS 'The date and time the 
 
 
 --
--- Name: mortgage_isbased_in_rrr_historic; Type: TABLE; Schema: administrative; Owner: postgres; Tablespace: 
+-- Name: mortgage_isbased_in_rrr_historic; Type: TABLE; Schema: administrative; Owner: postgres
 --
 
 CREATE TABLE mortgage_isbased_in_rrr_historic (
@@ -5249,10 +4991,10 @@ CREATE TABLE mortgage_isbased_in_rrr_historic (
 );
 
 
-ALTER TABLE administrative.mortgage_isbased_in_rrr_historic OWNER TO postgres;
+ALTER TABLE mortgage_isbased_in_rrr_historic OWNER TO postgres;
 
 --
--- Name: mortgage_type; Type: TABLE; Schema: administrative; Owner: postgres; Tablespace: 
+-- Name: mortgage_type; Type: TABLE; Schema: administrative; Owner: postgres
 --
 
 CREATE TABLE mortgage_type (
@@ -5263,7 +5005,7 @@ CREATE TABLE mortgage_type (
 );
 
 
-ALTER TABLE administrative.mortgage_type OWNER TO postgres;
+ALTER TABLE mortgage_type OWNER TO postgres;
 
 --
 -- Name: TABLE mortgage_type; Type: COMMENT; Schema: administrative; Owner: postgres
@@ -5302,7 +5044,7 @@ COMMENT ON COLUMN mortgage_type.status IS 'SOLA Extension: Status of the mortgag
 
 
 --
--- Name: notation; Type: TABLE; Schema: administrative; Owner: postgres; Tablespace: 
+-- Name: notation; Type: TABLE; Schema: administrative; Owner: postgres
 --
 
 CREATE TABLE notation (
@@ -5324,7 +5066,7 @@ CREATE TABLE notation (
 );
 
 
-ALTER TABLE administrative.notation OWNER TO postgres;
+ALTER TABLE notation OWNER TO postgres;
 
 --
 -- Name: TABLE notation; Type: COMMENT; Schema: administrative; Owner: postgres
@@ -5440,7 +5182,7 @@ COMMENT ON COLUMN notation.redact_code IS 'FROM  SOLA State Land Extension: The 
 
 
 --
--- Name: notation_historic; Type: TABLE; Schema: administrative; Owner: postgres; Tablespace: 
+-- Name: notation_historic; Type: TABLE; Schema: administrative; Owner: postgres
 --
 
 CREATE TABLE notation_historic (
@@ -5463,7 +5205,7 @@ CREATE TABLE notation_historic (
 );
 
 
-ALTER TABLE administrative.notation_historic OWNER TO postgres;
+ALTER TABLE notation_historic OWNER TO postgres;
 
 --
 -- Name: notation_reference_nr_seq; Type: SEQUENCE; Schema: administrative; Owner: postgres
@@ -5478,7 +5220,7 @@ CREATE SEQUENCE notation_reference_nr_seq
     CYCLE;
 
 
-ALTER TABLE administrative.notation_reference_nr_seq OWNER TO postgres;
+ALTER TABLE notation_reference_nr_seq OWNER TO postgres;
 
 --
 -- Name: SEQUENCE notation_reference_nr_seq; Type: COMMENT; Schema: administrative; Owner: postgres
@@ -5488,7 +5230,7 @@ COMMENT ON SEQUENCE notation_reference_nr_seq IS 'Sequence number used as the ba
 
 
 --
--- Name: party_for_rrr; Type: TABLE; Schema: administrative; Owner: postgres; Tablespace: 
+-- Name: party_for_rrr; Type: TABLE; Schema: administrative; Owner: postgres
 --
 
 CREATE TABLE party_for_rrr (
@@ -5503,7 +5245,7 @@ CREATE TABLE party_for_rrr (
 );
 
 
-ALTER TABLE administrative.party_for_rrr OWNER TO postgres;
+ALTER TABLE party_for_rrr OWNER TO postgres;
 
 --
 -- Name: TABLE party_for_rrr; Type: COMMENT; Schema: administrative; Owner: postgres
@@ -5570,7 +5312,7 @@ COMMENT ON COLUMN party_for_rrr.change_time IS 'The date and time the row was la
 
 
 --
--- Name: party_for_rrr_historic; Type: TABLE; Schema: administrative; Owner: postgres; Tablespace: 
+-- Name: party_for_rrr_historic; Type: TABLE; Schema: administrative; Owner: postgres
 --
 
 CREATE TABLE party_for_rrr_historic (
@@ -5586,10 +5328,10 @@ CREATE TABLE party_for_rrr_historic (
 );
 
 
-ALTER TABLE administrative.party_for_rrr_historic OWNER TO postgres;
+ALTER TABLE party_for_rrr_historic OWNER TO postgres;
 
 --
--- Name: required_relationship_baunit; Type: TABLE; Schema: administrative; Owner: postgres; Tablespace: 
+-- Name: required_relationship_baunit; Type: TABLE; Schema: administrative; Owner: postgres
 --
 
 CREATE TABLE required_relationship_baunit (
@@ -5604,7 +5346,7 @@ CREATE TABLE required_relationship_baunit (
 );
 
 
-ALTER TABLE administrative.required_relationship_baunit OWNER TO postgres;
+ALTER TABLE required_relationship_baunit OWNER TO postgres;
 
 --
 -- Name: TABLE required_relationship_baunit; Type: COMMENT; Schema: administrative; Owner: postgres
@@ -5671,7 +5413,7 @@ COMMENT ON COLUMN required_relationship_baunit.change_time IS 'The date and time
 
 
 --
--- Name: required_relationship_baunit_historic; Type: TABLE; Schema: administrative; Owner: postgres; Tablespace: 
+-- Name: required_relationship_baunit_historic; Type: TABLE; Schema: administrative; Owner: postgres
 --
 
 CREATE TABLE required_relationship_baunit_historic (
@@ -5687,10 +5429,10 @@ CREATE TABLE required_relationship_baunit_historic (
 );
 
 
-ALTER TABLE administrative.required_relationship_baunit_historic OWNER TO postgres;
+ALTER TABLE required_relationship_baunit_historic OWNER TO postgres;
 
 --
--- Name: rrr; Type: TABLE; Schema: administrative; Owner: postgres; Tablespace: 
+-- Name: rrr; Type: TABLE; Schema: administrative; Owner: postgres
 --
 
 CREATE TABLE rrr (
@@ -5719,7 +5461,7 @@ CREATE TABLE rrr (
 );
 
 
-ALTER TABLE administrative.rrr OWNER TO postgres;
+ALTER TABLE rrr OWNER TO postgres;
 
 --
 -- Name: TABLE rrr; Type: COMMENT; Schema: administrative; Owner: postgres
@@ -5884,7 +5626,7 @@ COMMENT ON COLUMN rrr.redact_code IS 'FROM  SOLA State Land Extension: The redac
 
 
 --
--- Name: rrr_group_type; Type: TABLE; Schema: administrative; Owner: postgres; Tablespace: 
+-- Name: rrr_group_type; Type: TABLE; Schema: administrative; Owner: postgres
 --
 
 CREATE TABLE rrr_group_type (
@@ -5895,7 +5637,7 @@ CREATE TABLE rrr_group_type (
 );
 
 
-ALTER TABLE administrative.rrr_group_type OWNER TO postgres;
+ALTER TABLE rrr_group_type OWNER TO postgres;
 
 --
 -- Name: TABLE rrr_group_type; Type: COMMENT; Schema: administrative; Owner: postgres
@@ -5934,7 +5676,7 @@ COMMENT ON COLUMN rrr_group_type.status IS 'SOLA Extension: Status of the RRR gr
 
 
 --
--- Name: rrr_historic; Type: TABLE; Schema: administrative; Owner: postgres; Tablespace: 
+-- Name: rrr_historic; Type: TABLE; Schema: administrative; Owner: postgres
 --
 
 CREATE TABLE rrr_historic (
@@ -5964,7 +5706,7 @@ CREATE TABLE rrr_historic (
 );
 
 
-ALTER TABLE administrative.rrr_historic OWNER TO postgres;
+ALTER TABLE rrr_historic OWNER TO postgres;
 
 --
 -- Name: rrr_nr_seq; Type: SEQUENCE; Schema: administrative; Owner: postgres
@@ -5979,7 +5721,7 @@ CREATE SEQUENCE rrr_nr_seq
     CYCLE;
 
 
-ALTER TABLE administrative.rrr_nr_seq OWNER TO postgres;
+ALTER TABLE rrr_nr_seq OWNER TO postgres;
 
 --
 -- Name: SEQUENCE rrr_nr_seq; Type: COMMENT; Schema: administrative; Owner: postgres
@@ -5989,7 +5731,7 @@ COMMENT ON SEQUENCE rrr_nr_seq IS 'Sequence number used as the basis for the RRR
 
 
 --
--- Name: rrr_share; Type: TABLE; Schema: administrative; Owner: postgres; Tablespace: 
+-- Name: rrr_share; Type: TABLE; Schema: administrative; Owner: postgres
 --
 
 CREATE TABLE rrr_share (
@@ -6005,7 +5747,7 @@ CREATE TABLE rrr_share (
 );
 
 
-ALTER TABLE administrative.rrr_share OWNER TO postgres;
+ALTER TABLE rrr_share OWNER TO postgres;
 
 --
 -- Name: TABLE rrr_share; Type: COMMENT; Schema: administrative; Owner: postgres
@@ -6079,7 +5821,7 @@ COMMENT ON COLUMN rrr_share.change_time IS 'The date and time the row was last m
 
 
 --
--- Name: rrr_share_historic; Type: TABLE; Schema: administrative; Owner: postgres; Tablespace: 
+-- Name: rrr_share_historic; Type: TABLE; Schema: administrative; Owner: postgres
 --
 
 CREATE TABLE rrr_share_historic (
@@ -6096,10 +5838,10 @@ CREATE TABLE rrr_share_historic (
 );
 
 
-ALTER TABLE administrative.rrr_share_historic OWNER TO postgres;
+ALTER TABLE rrr_share_historic OWNER TO postgres;
 
 --
--- Name: rrr_type; Type: TABLE; Schema: administrative; Owner: postgres; Tablespace: 
+-- Name: rrr_type; Type: TABLE; Schema: administrative; Owner: postgres
 --
 
 CREATE TABLE rrr_type (
@@ -6115,7 +5857,7 @@ CREATE TABLE rrr_type (
 );
 
 
-ALTER TABLE administrative.rrr_type OWNER TO postgres;
+ALTER TABLE rrr_type OWNER TO postgres;
 
 --
 -- Name: TABLE rrr_type; Type: COMMENT; Schema: administrative; Owner: postgres
@@ -6189,7 +5931,7 @@ COMMENT ON COLUMN rrr_type.rrr_panel_code IS 'SOLA Extension. Used to identify t
 
 
 --
--- Name: source_describes_ba_unit; Type: TABLE; Schema: administrative; Owner: postgres; Tablespace: 
+-- Name: source_describes_ba_unit; Type: TABLE; Schema: administrative; Owner: postgres
 --
 
 CREATE TABLE source_describes_ba_unit (
@@ -6203,7 +5945,7 @@ CREATE TABLE source_describes_ba_unit (
 );
 
 
-ALTER TABLE administrative.source_describes_ba_unit OWNER TO postgres;
+ALTER TABLE source_describes_ba_unit OWNER TO postgres;
 
 --
 -- Name: TABLE source_describes_ba_unit; Type: COMMENT; Schema: administrative; Owner: postgres
@@ -6263,7 +6005,7 @@ COMMENT ON COLUMN source_describes_ba_unit.change_time IS 'The date and time the
 
 
 --
--- Name: source_describes_ba_unit_historic; Type: TABLE; Schema: administrative; Owner: postgres; Tablespace: 
+-- Name: source_describes_ba_unit_historic; Type: TABLE; Schema: administrative; Owner: postgres
 --
 
 CREATE TABLE source_describes_ba_unit_historic (
@@ -6278,10 +6020,10 @@ CREATE TABLE source_describes_ba_unit_historic (
 );
 
 
-ALTER TABLE administrative.source_describes_ba_unit_historic OWNER TO postgres;
+ALTER TABLE source_describes_ba_unit_historic OWNER TO postgres;
 
 --
--- Name: source_describes_rrr; Type: TABLE; Schema: administrative; Owner: postgres; Tablespace: 
+-- Name: source_describes_rrr; Type: TABLE; Schema: administrative; Owner: postgres
 --
 
 CREATE TABLE source_describes_rrr (
@@ -6295,7 +6037,7 @@ CREATE TABLE source_describes_rrr (
 );
 
 
-ALTER TABLE administrative.source_describes_rrr OWNER TO postgres;
+ALTER TABLE source_describes_rrr OWNER TO postgres;
 
 --
 -- Name: TABLE source_describes_rrr; Type: COMMENT; Schema: administrative; Owner: postgres
@@ -6355,7 +6097,7 @@ COMMENT ON COLUMN source_describes_rrr.change_time IS 'The date and time the row
 
 
 --
--- Name: source_describes_rrr_historic; Type: TABLE; Schema: administrative; Owner: postgres; Tablespace: 
+-- Name: source_describes_rrr_historic; Type: TABLE; Schema: administrative; Owner: postgres
 --
 
 CREATE TABLE source_describes_rrr_historic (
@@ -6370,12 +6112,12 @@ CREATE TABLE source_describes_rrr_historic (
 );
 
 
-ALTER TABLE administrative.source_describes_rrr_historic OWNER TO postgres;
+ALTER TABLE source_describes_rrr_historic OWNER TO postgres;
 
 SET search_path = application, pg_catalog;
 
 --
--- Name: application; Type: TABLE; Schema: application; Owner: postgres; Tablespace: 
+-- Name: application; Type: TABLE; Schema: application; Owner: postgres
 --
 
 CREATE TABLE application (
@@ -6412,7 +6154,7 @@ CREATE TABLE application (
 );
 
 
-ALTER TABLE application.application OWNER TO postgres;
+ALTER TABLE application OWNER TO postgres;
 
 --
 -- Name: TABLE application; Type: COMMENT; Schema: application; Owner: postgres
@@ -6598,7 +6340,7 @@ COMMENT ON COLUMN application.redact_code IS 'FROM  SOLA State Land Extension: T
 
 
 --
--- Name: service; Type: TABLE; Schema: application; Owner: postgres; Tablespace: 
+-- Name: service; Type: TABLE; Schema: application; Owner: postgres
 --
 
 CREATE TABLE service (
@@ -6622,7 +6364,7 @@ CREATE TABLE service (
 );
 
 
-ALTER TABLE application.service OWNER TO postgres;
+ALTER TABLE service OWNER TO postgres;
 
 --
 -- Name: TABLE service; Type: COMMENT; Schema: application; Owner: postgres
@@ -6719,7 +6461,7 @@ COMMENT ON COLUMN service.value_fee IS 'The value fee charged for the service. C
 SET search_path = cadastre, pg_catalog;
 
 --
--- Name: cadastre_object; Type: TABLE; Schema: cadastre; Owner: postgres; Tablespace: 
+-- Name: cadastre_object; Type: TABLE; Schema: cadastre; Owner: postgres
 --
 
 CREATE TABLE cadastre_object (
@@ -6749,7 +6491,7 @@ CREATE TABLE cadastre_object (
 );
 
 
-ALTER TABLE cadastre.cadastre_object OWNER TO postgres;
+ALTER TABLE cadastre_object OWNER TO postgres;
 
 --
 -- Name: TABLE cadastre_object; Type: COMMENT; Schema: cadastre; Owner: postgres
@@ -6893,7 +6635,7 @@ COMMENT ON COLUMN cadastre_object.redact_code IS 'FROM  SOLA State Land Extensio
 
 
 --
--- Name: land_use_type; Type: TABLE; Schema: cadastre; Owner: postgres; Tablespace: 
+-- Name: land_use_type; Type: TABLE; Schema: cadastre; Owner: postgres
 --
 
 CREATE TABLE land_use_type (
@@ -6904,7 +6646,7 @@ CREATE TABLE land_use_type (
 );
 
 
-ALTER TABLE cadastre.land_use_type OWNER TO postgres;
+ALTER TABLE land_use_type OWNER TO postgres;
 
 --
 -- Name: TABLE land_use_type; Type: COMMENT; Schema: cadastre; Owner: postgres
@@ -6943,7 +6685,7 @@ COMMENT ON COLUMN land_use_type.status IS 'SOLA Extension: Status of the land us
 
 
 --
--- Name: spatial_value_area; Type: TABLE; Schema: cadastre; Owner: postgres; Tablespace: 
+-- Name: spatial_value_area; Type: TABLE; Schema: cadastre; Owner: postgres
 --
 
 CREATE TABLE spatial_value_area (
@@ -6958,7 +6700,7 @@ CREATE TABLE spatial_value_area (
 );
 
 
-ALTER TABLE cadastre.spatial_value_area OWNER TO postgres;
+ALTER TABLE spatial_value_area OWNER TO postgres;
 
 --
 -- Name: TABLE spatial_value_area; Type: COMMENT; Schema: cadastre; Owner: postgres
@@ -7028,7 +6770,7 @@ COMMENT ON COLUMN spatial_value_area.change_time IS 'The date and time the row w
 SET search_path = party, pg_catalog;
 
 --
--- Name: party; Type: TABLE; Schema: party; Owner: postgres; Tablespace: 
+-- Name: party; Type: TABLE; Schema: party; Owner: postgres
 --
 
 CREATE TABLE party (
@@ -7061,7 +6803,7 @@ CREATE TABLE party (
 );
 
 
-ALTER TABLE party.party OWNER TO postgres;
+ALTER TABLE party OWNER TO postgres;
 
 --
 -- Name: TABLE party; Type: COMMENT; Schema: party; Owner: postgres
@@ -7249,7 +6991,7 @@ COMMENT ON COLUMN party.redact_code IS 'FROM  SOLA State Land Extension: The red
 SET search_path = transaction, pg_catalog;
 
 --
--- Name: transaction; Type: TABLE; Schema: transaction; Owner: postgres; Tablespace: 
+-- Name: transaction; Type: TABLE; Schema: transaction; Owner: postgres
 --
 
 CREATE TABLE transaction (
@@ -7267,7 +7009,7 @@ CREATE TABLE transaction (
 );
 
 
-ALTER TABLE transaction.transaction OWNER TO postgres;
+ALTER TABLE transaction OWNER TO postgres;
 
 --
 -- Name: TABLE transaction; Type: COMMENT; Schema: transaction; Owner: postgres
@@ -7361,10 +7103,89 @@ SET search_path = administrative, pg_catalog;
 --
 
 CREATE VIEW sys_reg_owner_name AS
-    SELECT (((pp.name)::text || ' '::text) || (COALESCE(pp.last_name, ''::character varying))::text) AS value, (pp.name)::text AS name, (COALESCE(pp.last_name, ''::character varying))::text AS last_name, co.id, co.name_firstpart, co.name_lastpart, public.get_translation(lu.display_value, NULL::character varying) AS land_use_code, su.ba_unit_id, sa.size, CASE WHEN ((COALESCE(co.land_use_code, 'residential'::character varying))::text = 'residential'::text) THEN sa.size ELSE (0)::numeric END AS residential, CASE WHEN ((COALESCE(co.land_use_code, 'residential'::character varying))::text = 'agricultural'::text) THEN sa.size ELSE (0)::numeric END AS agricultural, CASE WHEN ((COALESCE(co.land_use_code, 'residential'::character varying))::text = 'commercial'::text) THEN sa.size ELSE (0)::numeric END AS commercial, CASE WHEN ((COALESCE(co.land_use_code, 'residential'::character varying))::text = 'industrial'::text) THEN sa.size ELSE (0)::numeric END AS industrial FROM cadastre.land_use_type lu, cadastre.cadastre_object co, cadastre.spatial_value_area sa, ba_unit_contains_spatial_unit su, application.application aa, application.service s, party.party pp, party_for_rrr pr, rrr rrr, ba_unit bu, transaction.transaction t WHERE (((((((((((((((sa.spatial_unit_id)::text = (co.id)::text) AND ((sa.type_code)::text = 'officialArea'::text)) AND ((su.spatial_unit_id)::text = (sa.spatial_unit_id)::text)) AND ((bu.transaction_id)::text = (t.id)::text)) AND ((t.from_service_id)::text = (s.id)::text)) AND ((s.application_id)::text = (aa.id)::text)) AND ((s.request_type_code)::text = 'systematicRegn'::text)) AND ((s.status_code)::text = 'completed'::text)) AND ((pp.id)::text = (pr.party_id)::text)) AND ((pr.rrr_id)::text = (rrr.id)::text)) AND ((rrr.ba_unit_id)::text = (su.ba_unit_id)::text)) AND ((((rrr.type_code)::text = 'ownership'::text) OR ((rrr.type_code)::text = 'apartment'::text)) OR ((rrr.type_code)::text = 'commonOwnership'::text))) AND ((bu.id)::text = (su.ba_unit_id)::text)) AND ((COALESCE(co.land_use_code, 'residential'::character varying))::text = (lu.code)::text)) UNION SELECT DISTINCT 'No Claimant '::text AS value, 'No Claimant '::text AS name, 'No Claimant '::text AS last_name, co.id, co.name_firstpart, co.name_lastpart, public.get_translation(lu.display_value, NULL::character varying) AS land_use_code, su.ba_unit_id, sa.size, CASE WHEN ((COALESCE(co.land_use_code, 'residential'::character varying))::text = 'residential'::text) THEN sa.size ELSE (0)::numeric END AS residential, CASE WHEN ((COALESCE(co.land_use_code, 'residential'::character varying))::text = 'agricultural'::text) THEN sa.size ELSE (0)::numeric END AS agricultural, CASE WHEN ((COALESCE(co.land_use_code, 'residential'::character varying))::text = 'commercial'::text) THEN sa.size ELSE (0)::numeric END AS commercial, CASE WHEN ((COALESCE(co.land_use_code, 'residential'::character varying))::text = 'industrial'::text) THEN sa.size ELSE (0)::numeric END AS industrial FROM cadastre.land_use_type lu, cadastre.cadastre_object co, cadastre.spatial_value_area sa, ba_unit_contains_spatial_unit su, application.application aa, party.party pp, party_for_rrr pr, rrr rrr, application.service s, ba_unit bu, transaction.transaction t WHERE ((((((((((((sa.spatial_unit_id)::text = (co.id)::text) AND ((COALESCE(co.land_use_code, 'residential'::character varying))::text = (lu.code)::text)) AND ((sa.type_code)::text = 'officialArea'::text)) AND ((bu.id)::text = (su.ba_unit_id)::text)) AND ((su.spatial_unit_id)::text = (sa.spatial_unit_id)::text)) AND ((bu.transaction_id)::text = (t.id)::text)) AND ((t.from_service_id)::text = (s.id)::text)) AND (NOT ((su.ba_unit_id)::text IN (SELECT rrr_1.ba_unit_id FROM rrr rrr_1, party.party pp_1, party_for_rrr pr_1 WHERE (((((((rrr_1.type_code)::text = 'ownership'::text) OR ((rrr_1.type_code)::text = 'apartment'::text)) OR ((rrr_1.type_code)::text = 'commonOwnership'::text)) OR ((rrr_1.type_code)::text = 'stateOwnership'::text)) AND ((pp_1.id)::text = (pr_1.party_id)::text)) AND ((pr_1.rrr_id)::text = (rrr_1.id)::text)))))) AND ((s.application_id)::text = (aa.id)::text)) AND ((s.request_type_code)::text = 'systematicRegn'::text)) AND ((s.status_code)::text = 'completed'::text)) ORDER BY 3, 2;
+ SELECT (((pp.name)::text || ' '::text) || (COALESCE(pp.last_name, ''::character varying))::text) AS value,
+    (pp.name)::text AS name,
+    (COALESCE(pp.last_name, ''::character varying))::text AS last_name,
+    co.id,
+    co.name_firstpart,
+    co.name_lastpart,
+    public.get_translation(lu.display_value, NULL::character varying) AS land_use_code,
+    su.ba_unit_id,
+    sa.size,
+        CASE
+            WHEN ((COALESCE(co.land_use_code, 'residential'::character varying))::text = 'residential'::text) THEN sa.size
+            ELSE (0)::numeric
+        END AS residential,
+        CASE
+            WHEN ((COALESCE(co.land_use_code, 'residential'::character varying))::text = 'agricultural'::text) THEN sa.size
+            ELSE (0)::numeric
+        END AS agricultural,
+        CASE
+            WHEN ((COALESCE(co.land_use_code, 'residential'::character varying))::text = 'commercial'::text) THEN sa.size
+            ELSE (0)::numeric
+        END AS commercial,
+        CASE
+            WHEN ((COALESCE(co.land_use_code, 'residential'::character varying))::text = 'industrial'::text) THEN sa.size
+            ELSE (0)::numeric
+        END AS industrial
+   FROM cadastre.land_use_type lu,
+    cadastre.cadastre_object co,
+    cadastre.spatial_value_area sa,
+    ba_unit_contains_spatial_unit su,
+    application.application aa,
+    application.service s,
+    party.party pp,
+    party_for_rrr pr,
+    rrr rrr,
+    ba_unit bu,
+    transaction.transaction t
+  WHERE (((sa.spatial_unit_id)::text = (co.id)::text) AND ((sa.type_code)::text = 'officialArea'::text) AND ((su.spatial_unit_id)::text = (sa.spatial_unit_id)::text) AND ((bu.transaction_id)::text = (t.id)::text) AND ((t.from_service_id)::text = (s.id)::text) AND ((s.application_id)::text = (aa.id)::text) AND ((s.request_type_code)::text = 'systematicRegn'::text) AND ((s.status_code)::text = 'completed'::text) AND ((pp.id)::text = (pr.party_id)::text) AND ((pr.rrr_id)::text = (rrr.id)::text) AND ((rrr.ba_unit_id)::text = (su.ba_unit_id)::text) AND (((rrr.type_code)::text = 'ownership'::text) OR ((rrr.type_code)::text = 'apartment'::text) OR ((rrr.type_code)::text = 'commonOwnership'::text)) AND ((bu.id)::text = (su.ba_unit_id)::text) AND ((COALESCE(co.land_use_code, 'residential'::character varying))::text = (lu.code)::text))
+UNION
+ SELECT DISTINCT 'No Claimant '::text AS value,
+    'No Claimant '::text AS name,
+    'No Claimant '::text AS last_name,
+    co.id,
+    co.name_firstpart,
+    co.name_lastpart,
+    public.get_translation(lu.display_value, NULL::character varying) AS land_use_code,
+    su.ba_unit_id,
+    sa.size,
+        CASE
+            WHEN ((COALESCE(co.land_use_code, 'residential'::character varying))::text = 'residential'::text) THEN sa.size
+            ELSE (0)::numeric
+        END AS residential,
+        CASE
+            WHEN ((COALESCE(co.land_use_code, 'residential'::character varying))::text = 'agricultural'::text) THEN sa.size
+            ELSE (0)::numeric
+        END AS agricultural,
+        CASE
+            WHEN ((COALESCE(co.land_use_code, 'residential'::character varying))::text = 'commercial'::text) THEN sa.size
+            ELSE (0)::numeric
+        END AS commercial,
+        CASE
+            WHEN ((COALESCE(co.land_use_code, 'residential'::character varying))::text = 'industrial'::text) THEN sa.size
+            ELSE (0)::numeric
+        END AS industrial
+   FROM cadastre.land_use_type lu,
+    cadastre.cadastre_object co,
+    cadastre.spatial_value_area sa,
+    ba_unit_contains_spatial_unit su,
+    application.application aa,
+    party.party pp,
+    party_for_rrr pr,
+    rrr rrr,
+    application.service s,
+    ba_unit bu,
+    transaction.transaction t
+  WHERE (((sa.spatial_unit_id)::text = (co.id)::text) AND ((COALESCE(co.land_use_code, 'residential'::character varying))::text = (lu.code)::text) AND ((sa.type_code)::text = 'officialArea'::text) AND ((bu.id)::text = (su.ba_unit_id)::text) AND ((su.spatial_unit_id)::text = (sa.spatial_unit_id)::text) AND ((bu.transaction_id)::text = (t.id)::text) AND ((t.from_service_id)::text = (s.id)::text) AND (NOT ((su.ba_unit_id)::text IN ( SELECT rrr_1.ba_unit_id
+           FROM rrr rrr_1,
+            party.party pp_1,
+            party_for_rrr pr_1
+          WHERE ((((rrr_1.type_code)::text = 'ownership'::text) OR ((rrr_1.type_code)::text = 'apartment'::text) OR ((rrr_1.type_code)::text = 'commonOwnership'::text) OR ((rrr_1.type_code)::text = 'stateOwnership'::text)) AND ((pp_1.id)::text = (pr_1.party_id)::text) AND ((pr_1.rrr_id)::text = (rrr_1.id)::text))))) AND ((s.application_id)::text = (aa.id)::text) AND ((s.request_type_code)::text = 'systematicRegn'::text) AND ((s.status_code)::text = 'completed'::text))
+  ORDER BY 3, 2;
 
 
-ALTER TABLE administrative.sys_reg_owner_name OWNER TO postgres;
+ALTER TABLE sys_reg_owner_name OWNER TO postgres;
 
 --
 -- Name: VIEW sys_reg_owner_name; Type: COMMENT; Schema: administrative; Owner: postgres
@@ -7378,10 +7199,45 @@ COMMENT ON VIEW sys_reg_owner_name IS 'Used by systematic registration to identi
 --
 
 CREATE VIEW sys_reg_state_land AS
-    SELECT (((pp.name)::text || ' '::text) || (COALESCE(pp.last_name, ' '::character varying))::text) AS value, co.id, co.name_firstpart, co.name_lastpart, public.get_translation(lu.display_value, NULL::character varying) AS land_use_code, su.ba_unit_id, sa.size, CASE WHEN ((COALESCE(co.land_use_code, 'residential'::character varying))::text = 'residential'::text) THEN sa.size ELSE (0)::numeric END AS residential, CASE WHEN ((COALESCE(co.land_use_code, 'residential'::character varying))::text = 'agricultural'::text) THEN sa.size ELSE (0)::numeric END AS agricultural, CASE WHEN ((COALESCE(co.land_use_code, 'residential'::character varying))::text = 'commercial'::text) THEN sa.size ELSE (0)::numeric END AS commercial, CASE WHEN ((COALESCE(co.land_use_code, 'residential'::character varying))::text = 'industrial'::text) THEN sa.size ELSE (0)::numeric END AS industrial FROM cadastre.land_use_type lu, cadastre.cadastre_object co, cadastre.spatial_value_area sa, ba_unit_contains_spatial_unit su, application.application aa, application.service s, party.party pp, party_for_rrr pr, rrr rrr, ba_unit bu, transaction.transaction t WHERE (((((((((((((((sa.spatial_unit_id)::text = (co.id)::text) AND ((COALESCE(co.land_use_code, 'residential'::character varying))::text = (lu.code)::text)) AND ((sa.type_code)::text = 'officialArea'::text)) AND ((su.spatial_unit_id)::text = (sa.spatial_unit_id)::text)) AND ((bu.transaction_id)::text = (t.id)::text)) AND ((t.from_service_id)::text = (s.id)::text)) AND ((s.application_id)::text = (aa.id)::text)) AND ((s.request_type_code)::text = 'systematicRegn'::text)) AND ((s.status_code)::text = 'completed'::text)) AND ((pp.id)::text = (pr.party_id)::text)) AND ((pr.rrr_id)::text = (rrr.id)::text)) AND ((rrr.ba_unit_id)::text = (su.ba_unit_id)::text)) AND ((rrr.type_code)::text = 'stateOwnership'::text)) AND ((bu.id)::text = (su.ba_unit_id)::text)) ORDER BY (((pp.name)::text || ' '::text) || (COALESCE(pp.last_name, ' '::character varying))::text);
+ SELECT (((pp.name)::text || ' '::text) || (COALESCE(pp.last_name, ' '::character varying))::text) AS value,
+    co.id,
+    co.name_firstpart,
+    co.name_lastpart,
+    public.get_translation(lu.display_value, NULL::character varying) AS land_use_code,
+    su.ba_unit_id,
+    sa.size,
+        CASE
+            WHEN ((COALESCE(co.land_use_code, 'residential'::character varying))::text = 'residential'::text) THEN sa.size
+            ELSE (0)::numeric
+        END AS residential,
+        CASE
+            WHEN ((COALESCE(co.land_use_code, 'residential'::character varying))::text = 'agricultural'::text) THEN sa.size
+            ELSE (0)::numeric
+        END AS agricultural,
+        CASE
+            WHEN ((COALESCE(co.land_use_code, 'residential'::character varying))::text = 'commercial'::text) THEN sa.size
+            ELSE (0)::numeric
+        END AS commercial,
+        CASE
+            WHEN ((COALESCE(co.land_use_code, 'residential'::character varying))::text = 'industrial'::text) THEN sa.size
+            ELSE (0)::numeric
+        END AS industrial
+   FROM cadastre.land_use_type lu,
+    cadastre.cadastre_object co,
+    cadastre.spatial_value_area sa,
+    ba_unit_contains_spatial_unit su,
+    application.application aa,
+    application.service s,
+    party.party pp,
+    party_for_rrr pr,
+    rrr rrr,
+    ba_unit bu,
+    transaction.transaction t
+  WHERE (((sa.spatial_unit_id)::text = (co.id)::text) AND ((COALESCE(co.land_use_code, 'residential'::character varying))::text = (lu.code)::text) AND ((sa.type_code)::text = 'officialArea'::text) AND ((su.spatial_unit_id)::text = (sa.spatial_unit_id)::text) AND ((bu.transaction_id)::text = (t.id)::text) AND ((t.from_service_id)::text = (s.id)::text) AND ((s.application_id)::text = (aa.id)::text) AND ((s.request_type_code)::text = 'systematicRegn'::text) AND ((s.status_code)::text = 'completed'::text) AND ((pp.id)::text = (pr.party_id)::text) AND ((pr.rrr_id)::text = (rrr.id)::text) AND ((rrr.ba_unit_id)::text = (su.ba_unit_id)::text) AND ((rrr.type_code)::text = 'stateOwnership'::text) AND ((bu.id)::text = (su.ba_unit_id)::text))
+  ORDER BY (((pp.name)::text || ' '::text) || (COALESCE(pp.last_name, ' '::character varying))::text);
 
 
-ALTER TABLE administrative.sys_reg_state_land OWNER TO postgres;
+ALTER TABLE sys_reg_state_land OWNER TO postgres;
 
 --
 -- Name: VIEW sys_reg_state_land; Type: COMMENT; Schema: administrative; Owner: postgres
@@ -7395,10 +7251,25 @@ COMMENT ON VIEW sys_reg_state_land IS 'Used by systematic registration to identi
 --
 
 CREATE VIEW systematic_registration_listing AS
-    SELECT DISTINCT co.id, co.name_firstpart, co.name_lastpart, sa.size, public.get_translation(lu.display_value, NULL::character varying) AS land_use_code, su.ba_unit_id, (((bu.name_firstpart)::text || '/'::text) || (bu.name_lastpart)::text) AS name FROM cadastre.land_use_type lu, cadastre.cadastre_object co, cadastre.spatial_value_area sa, ba_unit_contains_spatial_unit su, application.application aa, application.service s, ba_unit bu, transaction.transaction t WHERE (((((((((((sa.spatial_unit_id)::text = (co.id)::text) AND ((bu.transaction_id)::text = (t.id)::text)) AND ((t.from_service_id)::text = (s.id)::text)) AND ((sa.type_code)::text = 'officialArea'::text)) AND ((su.spatial_unit_id)::text = (sa.spatial_unit_id)::text)) AND ((s.application_id)::text = (aa.id)::text)) AND ((s.request_type_code)::text = 'systematicRegn'::text)) AND ((s.status_code)::text = 'completed'::text)) AND ((COALESCE(co.land_use_code, 'residential'::character varying))::text = (lu.code)::text)) AND ((bu.id)::text = (su.ba_unit_id)::text));
+ SELECT DISTINCT co.id,
+    co.name_firstpart,
+    co.name_lastpart,
+    sa.size,
+    public.get_translation(lu.display_value, NULL::character varying) AS land_use_code,
+    su.ba_unit_id,
+    (((bu.name_firstpart)::text || '/'::text) || (bu.name_lastpart)::text) AS name
+   FROM cadastre.land_use_type lu,
+    cadastre.cadastre_object co,
+    cadastre.spatial_value_area sa,
+    ba_unit_contains_spatial_unit su,
+    application.application aa,
+    application.service s,
+    ba_unit bu,
+    transaction.transaction t
+  WHERE (((sa.spatial_unit_id)::text = (co.id)::text) AND ((bu.transaction_id)::text = (t.id)::text) AND ((t.from_service_id)::text = (s.id)::text) AND ((sa.type_code)::text = 'officialArea'::text) AND ((su.spatial_unit_id)::text = (sa.spatial_unit_id)::text) AND ((s.application_id)::text = (aa.id)::text) AND ((s.request_type_code)::text = 'systematicRegn'::text) AND ((s.status_code)::text = 'completed'::text) AND ((COALESCE(co.land_use_code, 'residential'::character varying))::text = (lu.code)::text) AND ((bu.id)::text = (su.ba_unit_id)::text));
 
 
-ALTER TABLE administrative.systematic_registration_listing OWNER TO postgres;
+ALTER TABLE systematic_registration_listing OWNER TO postgres;
 
 --
 -- Name: VIEW systematic_registration_listing; Type: COMMENT; Schema: administrative; Owner: postgres
@@ -7410,7 +7281,7 @@ COMMENT ON VIEW systematic_registration_listing IS 'Used by systematic registrat
 SET search_path = application, pg_catalog;
 
 --
--- Name: application_action_type; Type: TABLE; Schema: application; Owner: postgres; Tablespace: 
+-- Name: application_action_type; Type: TABLE; Schema: application; Owner: postgres
 --
 
 CREATE TABLE application_action_type (
@@ -7422,7 +7293,7 @@ CREATE TABLE application_action_type (
 );
 
 
-ALTER TABLE application.application_action_type OWNER TO postgres;
+ALTER TABLE application_action_type OWNER TO postgres;
 
 --
 -- Name: TABLE application_action_type; Type: COMMENT; Schema: application; Owner: postgres
@@ -7461,7 +7332,7 @@ COMMENT ON COLUMN application_action_type.description IS 'Description of the app
 
 
 --
--- Name: application_historic; Type: TABLE; Schema: application; Owner: postgres; Tablespace: 
+-- Name: application_historic; Type: TABLE; Schema: application; Owner: postgres
 --
 
 CREATE TABLE application_historic (
@@ -7498,7 +7369,7 @@ CREATE TABLE application_historic (
 );
 
 
-ALTER TABLE application.application_historic OWNER TO postgres;
+ALTER TABLE application_historic OWNER TO postgres;
 
 --
 -- Name: application_nr_seq; Type: SEQUENCE; Schema: application; Owner: postgres
@@ -7513,7 +7384,7 @@ CREATE SEQUENCE application_nr_seq
     CYCLE;
 
 
-ALTER TABLE application.application_nr_seq OWNER TO postgres;
+ALTER TABLE application_nr_seq OWNER TO postgres;
 
 --
 -- Name: SEQUENCE application_nr_seq; Type: COMMENT; Schema: application; Owner: postgres
@@ -7523,7 +7394,7 @@ COMMENT ON SEQUENCE application_nr_seq IS 'Sequence number used as the basis for
 
 
 --
--- Name: application_property; Type: TABLE; Schema: application; Owner: postgres; Tablespace: 
+-- Name: application_property; Type: TABLE; Schema: application; Owner: postgres
 --
 
 CREATE TABLE application_property (
@@ -7545,7 +7416,7 @@ CREATE TABLE application_property (
 );
 
 
-ALTER TABLE application.application_property OWNER TO postgres;
+ALTER TABLE application_property OWNER TO postgres;
 
 --
 -- Name: TABLE application_property; Type: COMMENT; Schema: application; Owner: postgres
@@ -7661,7 +7532,7 @@ COMMENT ON COLUMN application_property.change_time IS 'The date and time the row
 
 
 --
--- Name: application_property_historic; Type: TABLE; Schema: application; Owner: postgres; Tablespace: 
+-- Name: application_property_historic; Type: TABLE; Schema: application; Owner: postgres
 --
 
 CREATE TABLE application_property_historic (
@@ -7684,10 +7555,10 @@ CREATE TABLE application_property_historic (
 );
 
 
-ALTER TABLE application.application_property_historic OWNER TO postgres;
+ALTER TABLE application_property_historic OWNER TO postgres;
 
 --
--- Name: application_spatial_unit; Type: TABLE; Schema: application; Owner: postgres; Tablespace: 
+-- Name: application_spatial_unit; Type: TABLE; Schema: application; Owner: postgres
 --
 
 CREATE TABLE application_spatial_unit (
@@ -7701,7 +7572,7 @@ CREATE TABLE application_spatial_unit (
 );
 
 
-ALTER TABLE application.application_spatial_unit OWNER TO postgres;
+ALTER TABLE application_spatial_unit OWNER TO postgres;
 
 --
 -- Name: TABLE application_spatial_unit; Type: COMMENT; Schema: application; Owner: postgres
@@ -7761,7 +7632,7 @@ COMMENT ON COLUMN application_spatial_unit.change_time IS 'The date and time the
 
 
 --
--- Name: application_spatial_unit_historic; Type: TABLE; Schema: application; Owner: postgres; Tablespace: 
+-- Name: application_spatial_unit_historic; Type: TABLE; Schema: application; Owner: postgres
 --
 
 CREATE TABLE application_spatial_unit_historic (
@@ -7776,10 +7647,10 @@ CREATE TABLE application_spatial_unit_historic (
 );
 
 
-ALTER TABLE application.application_spatial_unit_historic OWNER TO postgres;
+ALTER TABLE application_spatial_unit_historic OWNER TO postgres;
 
 --
--- Name: application_status_type; Type: TABLE; Schema: application; Owner: postgres; Tablespace: 
+-- Name: application_status_type; Type: TABLE; Schema: application; Owner: postgres
 --
 
 CREATE TABLE application_status_type (
@@ -7790,7 +7661,7 @@ CREATE TABLE application_status_type (
 );
 
 
-ALTER TABLE application.application_status_type OWNER TO postgres;
+ALTER TABLE application_status_type OWNER TO postgres;
 
 --
 -- Name: TABLE application_status_type; Type: COMMENT; Schema: application; Owner: postgres
@@ -7829,7 +7700,7 @@ COMMENT ON COLUMN application_status_type.description IS 'Description of the app
 
 
 --
--- Name: application_uses_source; Type: TABLE; Schema: application; Owner: postgres; Tablespace: 
+-- Name: application_uses_source; Type: TABLE; Schema: application; Owner: postgres
 --
 
 CREATE TABLE application_uses_source (
@@ -7843,7 +7714,7 @@ CREATE TABLE application_uses_source (
 );
 
 
-ALTER TABLE application.application_uses_source OWNER TO postgres;
+ALTER TABLE application_uses_source OWNER TO postgres;
 
 --
 -- Name: TABLE application_uses_source; Type: COMMENT; Schema: application; Owner: postgres
@@ -7903,7 +7774,7 @@ COMMENT ON COLUMN application_uses_source.change_time IS 'The date and time the 
 
 
 --
--- Name: application_uses_source_historic; Type: TABLE; Schema: application; Owner: postgres; Tablespace: 
+-- Name: application_uses_source_historic; Type: TABLE; Schema: application; Owner: postgres
 --
 
 CREATE TABLE application_uses_source_historic (
@@ -7918,92 +7789,364 @@ CREATE TABLE application_uses_source_historic (
 );
 
 
-ALTER TABLE application.application_uses_source_historic OWNER TO postgres;
-
-SET search_path = party, pg_catalog;
+ALTER TABLE application_uses_source_historic OWNER TO postgres;
 
 --
--- Name: group_party; Type: TABLE; Schema: party; Owner: postgres; Tablespace: 
+-- Name: notify; Type: TABLE; Schema: application; Owner: postgres
 --
 
-CREATE TABLE group_party (
+CREATE TABLE notify (
     id character varying(40) NOT NULL,
-    type_code character varying(20) NOT NULL,
-    rowidentifier character varying(40) DEFAULT public.uuid_generate_v1() NOT NULL,
-    rowversion integer DEFAULT 0 NOT NULL,
-    change_action character(1) DEFAULT 'i'::bpchar NOT NULL,
-    change_user character varying(50),
-    change_time timestamp without time zone DEFAULT now() NOT NULL
-);
-
-
-ALTER TABLE party.group_party OWNER TO postgres;
-
---
--- Name: TABLE group_party; Type: COMMENT; Schema: party; Owner: postgres
---
-
-COMMENT ON TABLE group_party IS 'Groups any number of parties into a distinct entity. Implementation of the LADM LA_GroupParty class. Not used by SOLA
-Tags: LADM Reference Object, Change History, Not Used';
-
-
---
--- Name: COLUMN group_party.id; Type: COMMENT; Schema: party; Owner: postgres
---
-
-COMMENT ON COLUMN group_party.id IS 'LADM Definition: Identifier for the group party.';
-
-
---
--- Name: COLUMN group_party.type_code; Type: COMMENT; Schema: party; Owner: postgres
---
-
-COMMENT ON COLUMN group_party.type_code IS 'LADM Definition: The type of the group party. E.g. family, tribe, association, etc.';
-
-
---
--- Name: COLUMN group_party.rowidentifier; Type: COMMENT; Schema: party; Owner: postgres
---
-
-COMMENT ON COLUMN group_party.rowidentifier IS 'SOLA Extension: Identifies the all change records for the row in the group_party_historic table';
-
-
---
--- Name: COLUMN group_party.rowversion; Type: COMMENT; Schema: party; Owner: postgres
---
-
-COMMENT ON COLUMN group_party.rowversion IS 'SOLA Extension: Sequential value indicating the number of times this row has been modified.';
-
-
---
--- Name: COLUMN group_party.change_action; Type: COMMENT; Schema: party; Owner: postgres
---
-
-COMMENT ON COLUMN group_party.change_action IS 'SOLA Extension: Indicates if the last data modification action that occurred to the row was insert (i), update (u) or delete (d).';
-
-
---
--- Name: COLUMN group_party.change_user; Type: COMMENT; Schema: party; Owner: postgres
---
-
-COMMENT ON COLUMN group_party.change_user IS 'SOLA Extension: The user id of the last person to modify the row.';
-
-
---
--- Name: COLUMN group_party.change_time; Type: COMMENT; Schema: party; Owner: postgres
---
-
-COMMENT ON COLUMN group_party.change_time IS 'SOLA Extension: The date and time the row was last modified.';
-
-
---
--- Name: party_member; Type: TABLE; Schema: party; Owner: postgres; Tablespace: 
---
-
-CREATE TABLE party_member (
+    service_id character varying(40) NOT NULL,
     party_id character varying(40) NOT NULL,
-    group_id character varying(40) NOT NULL,
-    share double precision,
+    relationship_type_code character varying(20) DEFAULT 'owner'::character varying NOT NULL,
+    description text,
+    classification_code character varying(20),
+    redact_code character varying(20),
+    rowidentifier character varying(40) DEFAULT public.uuid_generate_v1() NOT NULL,
+    rowversion integer DEFAULT 0 NOT NULL,
+    change_action character(1) DEFAULT 'i'::bpchar NOT NULL,
+    change_user character varying(50),
+    change_time timestamp without time zone DEFAULT now() NOT NULL,
+    cancel_service_id character varying(40),
+    status character varying(40) DEFAULT 'c'::character varying NOT NULL
+);
+
+
+ALTER TABLE notify OWNER TO postgres;
+
+--
+-- Name: TABLE notify; Type: COMMENT; Schema: application; Owner: postgres
+--
+
+COMMENT ON TABLE notify IS 'Identifies parties to be notified in bulk as well as the relationship the party has with the land affected by the job.
+Tags: SOLA State Land Extension, Change History';
+
+
+--
+-- Name: COLUMN notify.id; Type: COMMENT; Schema: application; Owner: postgres
+--
+
+COMMENT ON COLUMN notify.id IS 'Identifier for the notification.';
+
+
+--
+-- Name: COLUMN notify.service_id; Type: COMMENT; Schema: application; Owner: postgres
+--
+
+COMMENT ON COLUMN notify.service_id IS 'Identifier for the service.';
+
+
+--
+-- Name: COLUMN notify.party_id; Type: COMMENT; Schema: application; Owner: postgres
+--
+
+COMMENT ON COLUMN notify.party_id IS 'Identifier for the party.';
+
+
+--
+-- Name: COLUMN notify.relationship_type_code; Type: COMMENT; Schema: application; Owner: postgres
+--
+
+COMMENT ON COLUMN notify.relationship_type_code IS 'The type of relationship between the party and the land affected by the job. One of Owner, Adjoining Owner, Occupier, Adjoining Occupier, Rightholder, Other, etc.';
+
+
+--
+-- Name: COLUMN notify.description; Type: COMMENT; Schema: application; Owner: postgres
+--
+
+COMMENT ON COLUMN notify.description IS 'The description of the party to notify.';
+
+
+--
+-- Name: COLUMN notify.classification_code; Type: COMMENT; Schema: application; Owner: postgres
+--
+
+COMMENT ON COLUMN notify.classification_code IS 'SOLA State Land Extension: The security classification for this Notification Party. Only users with the security classification (or a higher classification) will be able to view the record. If null, the record is considered unrestricted.';
+
+
+--
+-- Name: COLUMN notify.redact_code; Type: COMMENT; Schema: application; Owner: postgres
+--
+
+COMMENT ON COLUMN notify.redact_code IS 'SOLA State Land Extension: The redact classification for this Notification Party. Only users with the redact classification (or a higher classification) will be able to view the record with un-redacted fields. If null, the record is considered unrestricted and no redaction to the record will occur unless bulk redaction classifications have been set for fields of the record.';
+
+
+--
+-- Name: COLUMN notify.rowidentifier; Type: COMMENT; Schema: application; Owner: postgres
+--
+
+COMMENT ON COLUMN notify.rowidentifier IS 'Identifies the all change records for the row in the notify_historic table';
+
+
+--
+-- Name: COLUMN notify.rowversion; Type: COMMENT; Schema: application; Owner: postgres
+--
+
+COMMENT ON COLUMN notify.rowversion IS 'Sequential value indicating the number of times this row has been modified.';
+
+
+--
+-- Name: COLUMN notify.change_action; Type: COMMENT; Schema: application; Owner: postgres
+--
+
+COMMENT ON COLUMN notify.change_action IS 'Indicates if the last data modification action that occurred to the row was insert (i), update (u) or delete (d).';
+
+
+--
+-- Name: COLUMN notify.change_user; Type: COMMENT; Schema: application; Owner: postgres
+--
+
+COMMENT ON COLUMN notify.change_user IS 'The user id of the last person to modify the row.';
+
+
+--
+-- Name: COLUMN notify.change_time; Type: COMMENT; Schema: application; Owner: postgres
+--
+
+COMMENT ON COLUMN notify.change_time IS 'The date and time the row was last modified.';
+
+
+--
+-- Name: notify_property; Type: TABLE; Schema: application; Owner: postgres
+--
+
+CREATE TABLE notify_property (
+    notify_id character varying(40) NOT NULL,
+    ba_unit_id character varying(40) NOT NULL,
+    rowidentifier character varying(40) DEFAULT public.uuid_generate_v1() NOT NULL,
+    rowversion integer DEFAULT 0 NOT NULL,
+    change_action character(1) DEFAULT 'i'::bpchar NOT NULL,
+    change_user character varying(50),
+    change_time timestamp without time zone DEFAULT now() NOT NULL,
+    cancel_service_id character varying(40),
+    status character varying(40) DEFAULT 'c'::character varying NOT NULL
+);
+
+
+ALTER TABLE notify_property OWNER TO postgres;
+
+--
+-- Name: TABLE notify_property; Type: COMMENT; Schema: application; Owner: postgres
+--
+
+COMMENT ON TABLE notify_property IS 'Identifies the properties (a.k.a. Ba Units) this notification party is related to. 
+Tags: FLOSS SOLA Extension, Change History';
+
+
+--
+-- Name: COLUMN notify_property.notify_id; Type: COMMENT; Schema: application; Owner: postgres
+--
+
+COMMENT ON COLUMN notify_property.notify_id IS 'Identifier for the notification party the record is associated to.';
+
+
+--
+-- Name: COLUMN notify_property.ba_unit_id; Type: COMMENT; Schema: application; Owner: postgres
+--
+
+COMMENT ON COLUMN notify_property.ba_unit_id IS 'Identifier of the property associated to the objection.';
+
+
+--
+-- Name: COLUMN notify_property.rowidentifier; Type: COMMENT; Schema: application; Owner: postgres
+--
+
+COMMENT ON COLUMN notify_property.rowidentifier IS 'Identifies the all change records for the row in the notify_property_historic table';
+
+
+--
+-- Name: COLUMN notify_property.rowversion; Type: COMMENT; Schema: application; Owner: postgres
+--
+
+COMMENT ON COLUMN notify_property.rowversion IS 'Sequential value indicating the number of times this row has been modified.';
+
+
+--
+-- Name: COLUMN notify_property.change_action; Type: COMMENT; Schema: application; Owner: postgres
+--
+
+COMMENT ON COLUMN notify_property.change_action IS 'Indicates if the last data modification action that occurred to the row was insert (i), update (u) or delete (d).';
+
+
+--
+-- Name: COLUMN notify_property.change_user; Type: COMMENT; Schema: application; Owner: postgres
+--
+
+COMMENT ON COLUMN notify_property.change_user IS 'The user id of the last person to modify the row.';
+
+
+--
+-- Name: COLUMN notify_property.change_time; Type: COMMENT; Schema: application; Owner: postgres
+--
+
+COMMENT ON COLUMN notify_property.change_time IS 'The date and time the row was last modified.';
+
+
+--
+-- Name: notifiable_party_for_baunit; Type: VIEW; Schema: application; Owner: postgres
+--
+
+CREATE VIEW notifiable_party_for_baunit AS
+ SELECT n.party_id,
+    nt.party_id AS target_party_id,
+    n.service_id,
+    s.application_id,
+    np.cancel_service_id,
+    n.status,
+    (((bu.name_firstpart)::text || '/'::text) || (bu.name_lastpart)::text) AS baunit_name,
+    n.rowidentifier,
+    n.rowversion,
+    n.change_action,
+    n.change_user,
+    n.change_time,
+    n.id AS notifyid,
+    nt.id AS notifytargetid
+   FROM service s,
+    administrative.ba_unit bu,
+    notify n,
+    notify nt,
+    notify_property np,
+    administrative.party_for_rrr pr,
+    administrative.rrr rrr
+  WHERE (((n.service_id)::text = (s.id)::text) AND ((bu.id)::text = (np.ba_unit_id)::text) AND ((np.notify_id)::text = (n.id)::text) AND ((n.relationship_type_code)::text = 'safeguard'::text) AND ((nt.service_id)::text = (s.id)::text) AND ((nt.relationship_type_code)::text = 'owner'::text) AND ((nt.party_id)::text = (pr.party_id)::text) AND ((pr.rrr_id)::text = (rrr.id)::text) AND ((rrr.ba_unit_id)::text = (bu.id)::text));
+
+
+ALTER TABLE notifiable_party_for_baunit OWNER TO postgres;
+
+--
+-- Name: cancel_notification; Type: VIEW; Schema: application; Owner: postgres
+--
+
+CREATE VIEW cancel_notification AS
+ SELECT pp.name AS partyname,
+    pp.last_name AS partylastname,
+    tpp.name AS targetpartyname,
+    tpp.last_name AS targetpartylastname,
+    npbu.party_id,
+    npbu.target_party_id,
+    npbu.baunit_name,
+    npbu.service_id,
+    npbu.cancel_service_id
+   FROM party.party pp,
+    party.party tpp,
+    notifiable_party_for_baunit npbu,
+    application aa,
+    service s
+  WHERE (((s.application_id)::text = (aa.id)::text) AND ((s.id)::text = (npbu.cancel_service_id)::text) AND ((pp.id)::text = (npbu.party_id)::text) AND ((tpp.id)::text = (npbu.target_party_id)::text) AND ((s.request_type_code)::text = 'cancelRelationship'::text));
+
+
+ALTER TABLE cancel_notification OWNER TO postgres;
+
+--
+-- Name: notify_historic; Type: TABLE; Schema: application; Owner: postgres
+--
+
+CREATE TABLE notify_historic (
+    id character varying(40),
+    service_id character varying(40),
+    party_id character varying(40),
+    relationship_type_code character varying(20),
+    description text,
+    classification_code character varying(20),
+    redact_code character varying(20),
+    cancel_service_id character varying(40),
+    status character varying(40) DEFAULT 'c'::character varying NOT NULL,
+    rowidentifier character varying(40),
+    rowversion integer DEFAULT 0 NOT NULL,
+    change_action character(1),
+    change_user character varying(50),
+    change_time timestamp without time zone,
+    change_time_valid_until timestamp without time zone DEFAULT now() NOT NULL
+);
+
+
+ALTER TABLE notify_historic OWNER TO postgres;
+
+--
+-- Name: TABLE notify_historic; Type: COMMENT; Schema: application; Owner: postgres
+--
+
+COMMENT ON TABLE notify_historic IS 'History table for the application.notify table';
+
+
+--
+-- Name: notify_property_historic; Type: TABLE; Schema: application; Owner: postgres
+--
+
+CREATE TABLE notify_property_historic (
+    notify_id character varying(40),
+    ba_unit_id character varying(40),
+    rowidentifier character varying(40),
+    rowversion integer,
+    change_action character(1),
+    change_user character varying(50),
+    change_time timestamp without time zone,
+    change_time_valid_until timestamp without time zone DEFAULT now() NOT NULL,
+    cancel_service_id character varying(40),
+    status character varying(40) DEFAULT 'c'::character varying NOT NULL
+);
+
+
+ALTER TABLE notify_property_historic OWNER TO postgres;
+
+--
+-- Name: notify_relationship_type; Type: TABLE; Schema: application; Owner: postgres
+--
+
+CREATE TABLE notify_relationship_type (
+    code character varying(20) NOT NULL,
+    display_value character varying(250) NOT NULL,
+    description text,
+    status character(1) NOT NULL
+);
+
+
+ALTER TABLE notify_relationship_type OWNER TO postgres;
+
+--
+-- Name: TABLE notify_relationship_type; Type: COMMENT; Schema: application; Owner: postgres
+--
+
+COMMENT ON TABLE notify_relationship_type IS 'Code list identifying the type of relationship a party has with land affected by a job. Used for bulk notification purposes. 
+Tags: SOLA State Land Extension, Reference Table';
+
+
+--
+-- Name: COLUMN notify_relationship_type.code; Type: COMMENT; Schema: application; Owner: postgres
+--
+
+COMMENT ON COLUMN notify_relationship_type.code IS 'The code for the relationship type.';
+
+
+--
+-- Name: COLUMN notify_relationship_type.display_value; Type: COMMENT; Schema: application; Owner: postgres
+--
+
+COMMENT ON COLUMN notify_relationship_type.display_value IS 'Displayed value of the relationship type.';
+
+
+--
+-- Name: COLUMN notify_relationship_type.description; Type: COMMENT; Schema: application; Owner: postgres
+--
+
+COMMENT ON COLUMN notify_relationship_type.description IS 'Description of the relationship type.';
+
+
+--
+-- Name: COLUMN notify_relationship_type.status; Type: COMMENT; Schema: application; Owner: postgres
+--
+
+COMMENT ON COLUMN notify_relationship_type.status IS 'Status of the relationship type (c - current, x - no longer valid).';
+
+
+--
+-- Name: notify_uses_source; Type: TABLE; Schema: application; Owner: postgres
+--
+
+CREATE TABLE notify_uses_source (
+    notify_id character varying(40) NOT NULL,
+    source_id character varying(40) NOT NULL,
     rowidentifier character varying(40) DEFAULT public.uuid_generate_v1() NOT NULL,
     rowversion integer DEFAULT 0 NOT NULL,
     change_action character(1) DEFAULT 'i'::bpchar NOT NULL,
@@ -8012,76 +8155,85 @@ CREATE TABLE party_member (
 );
 
 
-ALTER TABLE party.party_member OWNER TO postgres;
+ALTER TABLE notify_uses_source OWNER TO postgres;
 
 --
--- Name: TABLE party_member; Type: COMMENT; Schema: party; Owner: postgres
+-- Name: TABLE notify_uses_source; Type: COMMENT; Schema: application; Owner: postgres
 --
 
-COMMENT ON TABLE party_member IS 'Identifies the parties belonging to a group party. Implementation of the LADM LA_PartyMember class. Not used by SOLA.
-Tags: LADM Reference Object, Change History, Not Used';
-
-
---
--- Name: COLUMN party_member.party_id; Type: COMMENT; Schema: party; Owner: postgres
---
-
-COMMENT ON COLUMN party_member.party_id IS 'LADM Definition: Identifier for the party.';
+COMMENT ON TABLE notify_uses_source IS 'Links the notification parties to the sources (a.k.a. documents) genreated for the bulk notification. 
+Tags: FLOSS SOLA Extension, Change History';
 
 
 --
--- Name: COLUMN party_member.group_id; Type: COMMENT; Schema: party; Owner: postgres
+-- Name: COLUMN notify_uses_source.notify_id; Type: COMMENT; Schema: application; Owner: postgres
 --
 
-COMMENT ON COLUMN party_member.group_id IS 'LADM Definition: Identifier of the group party';
-
-
---
--- Name: COLUMN party_member.share; Type: COMMENT; Schema: party; Owner: postgres
---
-
-COMMENT ON COLUMN party_member.share IS 'LADM Definition: The share of a RRR held by a party member expressed as a fraction with a numerator and a denominator.';
+COMMENT ON COLUMN notify_uses_source.notify_id IS 'Identifier for the notification party the record is associated to.';
 
 
 --
--- Name: COLUMN party_member.rowidentifier; Type: COMMENT; Schema: party; Owner: postgres
+-- Name: COLUMN notify_uses_source.source_id; Type: COMMENT; Schema: application; Owner: postgres
 --
 
-COMMENT ON COLUMN party_member.rowidentifier IS 'SOLA Extension: Identifies the all change records for the row in the party_member_historic table';
-
-
---
--- Name: COLUMN party_member.rowversion; Type: COMMENT; Schema: party; Owner: postgres
---
-
-COMMENT ON COLUMN party_member.rowversion IS 'SOLA Extension: Sequential value indicating the number of times this row has been modified.';
+COMMENT ON COLUMN notify_uses_source.source_id IS 'Identifier of the source associated to the application.';
 
 
 --
--- Name: COLUMN party_member.change_action; Type: COMMENT; Schema: party; Owner: postgres
+-- Name: COLUMN notify_uses_source.rowidentifier; Type: COMMENT; Schema: application; Owner: postgres
 --
 
-COMMENT ON COLUMN party_member.change_action IS 'SOLA Extension: Indicates if the last data modification action that occurred to the row was insert (i), update (u) or delete (d).';
-
-
---
--- Name: COLUMN party_member.change_user; Type: COMMENT; Schema: party; Owner: postgres
---
-
-COMMENT ON COLUMN party_member.change_user IS 'SOLA Extension: The user id of the last person to modify the row.';
+COMMENT ON COLUMN notify_uses_source.rowidentifier IS 'Identifies the all change records for the row in the objection_uses_source_historic table';
 
 
 --
--- Name: COLUMN party_member.change_time; Type: COMMENT; Schema: party; Owner: postgres
+-- Name: COLUMN notify_uses_source.rowversion; Type: COMMENT; Schema: application; Owner: postgres
 --
 
-COMMENT ON COLUMN party_member.change_time IS 'SOLA Extension: The date and time the row was last modified.';
+COMMENT ON COLUMN notify_uses_source.rowversion IS 'Sequential value indicating the number of times this row has been modified.';
 
-
-SET search_path = application, pg_catalog;
 
 --
--- Name: request_category_type; Type: TABLE; Schema: application; Owner: postgres; Tablespace: 
+-- Name: COLUMN notify_uses_source.change_action; Type: COMMENT; Schema: application; Owner: postgres
+--
+
+COMMENT ON COLUMN notify_uses_source.change_action IS 'Indicates if the last data modification action that occurred to the row was insert (i), update (u) or delete (d).';
+
+
+--
+-- Name: COLUMN notify_uses_source.change_user; Type: COMMENT; Schema: application; Owner: postgres
+--
+
+COMMENT ON COLUMN notify_uses_source.change_user IS 'The user id of the last person to modify the row.';
+
+
+--
+-- Name: COLUMN notify_uses_source.change_time; Type: COMMENT; Schema: application; Owner: postgres
+--
+
+COMMENT ON COLUMN notify_uses_source.change_time IS 'The date and time the row was last modified.';
+
+
+--
+-- Name: notify_uses_source_historic; Type: TABLE; Schema: application; Owner: postgres
+--
+
+CREATE TABLE notify_uses_source_historic (
+    notify_id character varying(40),
+    source_id character varying(40),
+    rowidentifier character varying(40),
+    rowversion integer,
+    change_action character(1),
+    change_user character varying(50),
+    change_time timestamp without time zone,
+    change_time_valid_until timestamp without time zone DEFAULT now() NOT NULL
+);
+
+
+ALTER TABLE notify_uses_source_historic OWNER TO postgres;
+
+--
+-- Name: request_category_type; Type: TABLE; Schema: application; Owner: postgres
 --
 
 CREATE TABLE request_category_type (
@@ -8092,7 +8244,7 @@ CREATE TABLE request_category_type (
 );
 
 
-ALTER TABLE application.request_category_type OWNER TO postgres;
+ALTER TABLE request_category_type OWNER TO postgres;
 
 --
 -- Name: TABLE request_category_type; Type: COMMENT; Schema: application; Owner: postgres
@@ -8131,7 +8283,7 @@ COMMENT ON COLUMN request_category_type.status IS 'Status of the request categor
 
 
 --
--- Name: request_display_group; Type: TABLE; Schema: application; Owner: postgres; Tablespace: 
+-- Name: request_display_group; Type: TABLE; Schema: application; Owner: postgres
 --
 
 CREATE TABLE request_display_group (
@@ -8142,7 +8294,7 @@ CREATE TABLE request_display_group (
 );
 
 
-ALTER TABLE application.request_display_group OWNER TO postgres;
+ALTER TABLE request_display_group OWNER TO postgres;
 
 --
 -- Name: TABLE request_display_group; Type: COMMENT; Schema: application; Owner: postgres
@@ -8181,7 +8333,7 @@ COMMENT ON COLUMN request_display_group.status IS 'Status of the negotiation typ
 
 
 --
--- Name: request_type; Type: TABLE; Schema: application; Owner: postgres; Tablespace: 
+-- Name: request_type; Type: TABLE; Schema: application; Owner: postgres
 --
 
 CREATE TABLE request_type (
@@ -8204,7 +8356,7 @@ CREATE TABLE request_type (
 );
 
 
-ALTER TABLE application.request_type OWNER TO postgres;
+ALTER TABLE request_type OWNER TO postgres;
 
 --
 -- Name: TABLE request_type; Type: COMMENT; Schema: application; Owner: postgres
@@ -8327,7 +8479,7 @@ COMMENT ON COLUMN request_type.display_order IS 'SOLA Extension. Used to order t
 
 
 --
--- Name: request_type_requires_source_type; Type: TABLE; Schema: application; Owner: postgres; Tablespace: 
+-- Name: request_type_requires_source_type; Type: TABLE; Schema: application; Owner: postgres
 --
 
 CREATE TABLE request_type_requires_source_type (
@@ -8336,7 +8488,7 @@ CREATE TABLE request_type_requires_source_type (
 );
 
 
-ALTER TABLE application.request_type_requires_source_type OWNER TO postgres;
+ALTER TABLE request_type_requires_source_type OWNER TO postgres;
 
 --
 -- Name: TABLE request_type_requires_source_type; Type: COMMENT; Schema: application; Owner: postgres
@@ -8361,7 +8513,7 @@ COMMENT ON COLUMN request_type_requires_source_type.request_type_code IS 'The re
 
 
 --
--- Name: service_action_type; Type: TABLE; Schema: application; Owner: postgres; Tablespace: 
+-- Name: service_action_type; Type: TABLE; Schema: application; Owner: postgres
 --
 
 CREATE TABLE service_action_type (
@@ -8373,7 +8525,7 @@ CREATE TABLE service_action_type (
 );
 
 
-ALTER TABLE application.service_action_type OWNER TO postgres;
+ALTER TABLE service_action_type OWNER TO postgres;
 
 --
 -- Name: TABLE service_action_type; Type: COMMENT; Schema: application; Owner: postgres
@@ -8419,7 +8571,7 @@ COMMENT ON COLUMN service_action_type.description IS 'Description of the service
 
 
 --
--- Name: service_historic; Type: TABLE; Schema: application; Owner: postgres; Tablespace: 
+-- Name: service_historic; Type: TABLE; Schema: application; Owner: postgres
 --
 
 CREATE TABLE service_historic (
@@ -8444,10 +8596,10 @@ CREATE TABLE service_historic (
 );
 
 
-ALTER TABLE application.service_historic OWNER TO postgres;
+ALTER TABLE service_historic OWNER TO postgres;
 
 --
--- Name: service_status_type; Type: TABLE; Schema: application; Owner: postgres; Tablespace: 
+-- Name: service_status_type; Type: TABLE; Schema: application; Owner: postgres
 --
 
 CREATE TABLE service_status_type (
@@ -8458,7 +8610,7 @@ CREATE TABLE service_status_type (
 );
 
 
-ALTER TABLE application.service_status_type OWNER TO postgres;
+ALTER TABLE service_status_type OWNER TO postgres;
 
 --
 -- Name: TABLE service_status_type; Type: COMMENT; Schema: application; Owner: postgres
@@ -8501,10 +8653,22 @@ COMMENT ON COLUMN service_status_type.description IS 'Description of the service
 --
 
 CREATE VIEW systematic_registration_certificates AS
-    SELECT aa.nr, co.name_firstpart, co.name_lastpart, su.ba_unit_id FROM application_status_type ast, cadastre.cadastre_object co, administrative.ba_unit bu, cadastre.spatial_value_area sa, administrative.ba_unit_contains_spatial_unit su, application aa, service s, transaction.transaction t WHERE (((((((((((sa.spatial_unit_id)::text = (co.id)::text) AND ((sa.type_code)::text = 'officialArea'::text)) AND ((su.spatial_unit_id)::text = (sa.spatial_unit_id)::text)) AND ((su.ba_unit_id)::text = (bu.id)::text)) AND ((bu.transaction_id)::text = (t.id)::text)) AND ((t.from_service_id)::text = (s.id)::text)) AND ((s.application_id)::text = (aa.id)::text)) AND ((s.request_type_code)::text = 'systematicRegn'::text)) AND ((aa.status_code)::text = (ast.code)::text)) AND ((aa.status_code)::text = 'approved'::text));
+ SELECT aa.nr,
+    co.name_firstpart,
+    co.name_lastpart,
+    su.ba_unit_id
+   FROM application_status_type ast,
+    cadastre.cadastre_object co,
+    administrative.ba_unit bu,
+    cadastre.spatial_value_area sa,
+    administrative.ba_unit_contains_spatial_unit su,
+    application aa,
+    service s,
+    transaction.transaction t
+  WHERE (((sa.spatial_unit_id)::text = (co.id)::text) AND ((sa.type_code)::text = 'officialArea'::text) AND ((su.spatial_unit_id)::text = (sa.spatial_unit_id)::text) AND ((su.ba_unit_id)::text = (bu.id)::text) AND ((bu.transaction_id)::text = (t.id)::text) AND ((t.from_service_id)::text = (s.id)::text) AND ((s.application_id)::text = (aa.id)::text) AND ((s.request_type_code)::text = 'systematicRegn'::text) AND ((aa.status_code)::text = (ast.code)::text) AND ((aa.status_code)::text = 'approved'::text));
 
 
-ALTER TABLE application.systematic_registration_certificates OWNER TO postgres;
+ALTER TABLE systematic_registration_certificates OWNER TO postgres;
 
 --
 -- Name: VIEW systematic_registration_certificates; Type: COMMENT; Schema: application; Owner: postgres
@@ -8514,7 +8678,7 @@ COMMENT ON VIEW systematic_registration_certificates IS 'Used by systematic regi
 
 
 --
--- Name: type_action; Type: TABLE; Schema: application; Owner: postgres; Tablespace: 
+-- Name: type_action; Type: TABLE; Schema: application; Owner: postgres
 --
 
 CREATE TABLE type_action (
@@ -8525,7 +8689,7 @@ CREATE TABLE type_action (
 );
 
 
-ALTER TABLE application.type_action OWNER TO postgres;
+ALTER TABLE type_action OWNER TO postgres;
 
 --
 -- Name: TABLE type_action; Type: COMMENT; Schema: application; Owner: postgres
@@ -8563,111 +8727,10 @@ COMMENT ON COLUMN type_action.description IS 'Description of the request type ac
 COMMENT ON COLUMN type_action.status IS 'Status of the request type action.';
 
 
-SET search_path = bulk_operation, pg_catalog;
-
---
--- Name: spatial_unit_temporary; Type: TABLE; Schema: bulk_operation; Owner: postgres; Tablespace: 
---
-
-CREATE TABLE spatial_unit_temporary (
-    id character varying(40) NOT NULL,
-    transaction_id character varying(40) NOT NULL,
-    type_code character varying(20) NOT NULL,
-    cadastre_object_type_code character varying(20),
-    name_firstpart character varying(20),
-    name_lastpart character varying(50),
-    geom public.geometry NOT NULL,
-    official_area numeric(29,2),
-    label character varying(100),
-    rowidentifier character varying(40) DEFAULT public.uuid_generate_v1() NOT NULL,
-    rowversion integer DEFAULT 0 NOT NULL,
-    change_action character(1) DEFAULT 'i'::bpchar NOT NULL,
-    change_user character varying(50),
-    change_time timestamp without time zone DEFAULT now() NOT NULL,
-    CONSTRAINT enforce_dims_geom CHECK ((public.st_ndims(geom) = 2)),
-    CONSTRAINT enforce_srid_geom CHECK ((public.st_srid(geom) = 2193)),
-    CONSTRAINT enforce_valid_geom CHECK (public.st_isvalid(geom))
-);
-
-
-ALTER TABLE bulk_operation.spatial_unit_temporary OWNER TO postgres;
-
---
--- Name: TABLE spatial_unit_temporary; Type: COMMENT; Schema: bulk_operation; Owner: postgres
---
-
-COMMENT ON TABLE spatial_unit_temporary IS 'Used as a staging area when loading spatial objects with the bulk operations functionality. Data in this table is validated and any field values generated (e.g. name_firstpart) prior to transferring the data into the cadastre object table.  
-Tags: FLOSS SOLA Extension';
-
-
---
--- Name: COLUMN spatial_unit_temporary.id; Type: COMMENT; Schema: bulk_operation; Owner: postgres
---
-
-COMMENT ON COLUMN spatial_unit_temporary.id IS 'Identifier for the record.';
-
-
---
--- Name: COLUMN spatial_unit_temporary.transaction_id; Type: COMMENT; Schema: bulk_operation; Owner: postgres
---
-
-COMMENT ON COLUMN spatial_unit_temporary.transaction_id IS 'The identifier of the transation associated to the bulk operation.';
-
-
---
--- Name: COLUMN spatial_unit_temporary.type_code; Type: COMMENT; Schema: bulk_operation; Owner: postgres
---
-
-COMMENT ON COLUMN spatial_unit_temporary.type_code IS 'The type of object that will be uploaded.';
-
-
---
--- Name: COLUMN spatial_unit_temporary.cadastre_object_type_code; Type: COMMENT; Schema: bulk_operation; Owner: postgres
---
-
-COMMENT ON COLUMN spatial_unit_temporary.cadastre_object_type_code IS 'The type of the cadastre object. Only applicable if the type_code is cadastre_object.';
-
-
---
--- Name: COLUMN spatial_unit_temporary.name_firstpart; Type: COMMENT; Schema: bulk_operation; Owner: postgres
---
-
-COMMENT ON COLUMN spatial_unit_temporary.name_firstpart IS 'The first part of the name for the cadastre object. Only applicable if the type_code is cadastre_object.';
-
-
---
--- Name: COLUMN spatial_unit_temporary.name_lastpart; Type: COMMENT; Schema: bulk_operation; Owner: postgres
---
-
-COMMENT ON COLUMN spatial_unit_temporary.name_lastpart IS 'The last or remaining part of the name for the cadastre object. Only applicable if the type_code is cadastre_object.';
-
-
---
--- Name: COLUMN spatial_unit_temporary.geom; Type: COMMENT; Schema: bulk_operation; Owner: postgres
---
-
-COMMENT ON COLUMN spatial_unit_temporary.geom IS 'The geometry for the spaital unit.';
-
-
---
--- Name: COLUMN spatial_unit_temporary.official_area; Type: COMMENT; Schema: bulk_operation; Owner: postgres
---
-
-COMMENT ON COLUMN spatial_unit_temporary.official_area IS 'The official area for the cadastre object. Only applicable if the type_code is cadastre_object.';
-
-
---
--- Name: COLUMN spatial_unit_temporary.label; Type: COMMENT; Schema: bulk_operation; Owner: postgres
---
-
-COMMENT ON COLUMN spatial_unit_temporary.label IS 'The label to use for the spatial unit. Only applicable if the type_code IS NOT cadastre_object.';
-
-
-
 SET search_path = cadastre, pg_catalog;
 
 --
--- Name: area_type; Type: TABLE; Schema: cadastre; Owner: postgres; Tablespace: 
+-- Name: area_type; Type: TABLE; Schema: cadastre; Owner: postgres
 --
 
 CREATE TABLE area_type (
@@ -8678,7 +8741,7 @@ CREATE TABLE area_type (
 );
 
 
-ALTER TABLE cadastre.area_type OWNER TO postgres;
+ALTER TABLE area_type OWNER TO postgres;
 
 --
 -- Name: TABLE area_type; Type: COMMENT; Schema: cadastre; Owner: postgres
@@ -8717,7 +8780,7 @@ COMMENT ON COLUMN area_type.status IS 'SOLA Extension: Status of the area type';
 
 
 --
--- Name: building_unit_type; Type: TABLE; Schema: cadastre; Owner: postgres; Tablespace: 
+-- Name: building_unit_type; Type: TABLE; Schema: cadastre; Owner: postgres
 --
 
 CREATE TABLE building_unit_type (
@@ -8728,7 +8791,7 @@ CREATE TABLE building_unit_type (
 );
 
 
-ALTER TABLE cadastre.building_unit_type OWNER TO postgres;
+ALTER TABLE building_unit_type OWNER TO postgres;
 
 --
 -- Name: TABLE building_unit_type; Type: COMMENT; Schema: cadastre; Owner: postgres
@@ -8767,7 +8830,7 @@ COMMENT ON COLUMN building_unit_type.status IS 'SOLA Extension: Status of the bu
 
 
 --
--- Name: cadastre_object_historic; Type: TABLE; Schema: cadastre; Owner: postgres; Tablespace: 
+-- Name: cadastre_object_historic; Type: TABLE; Schema: cadastre; Owner: postgres
 --
 
 CREATE TABLE cadastre_object_historic (
@@ -8798,10 +8861,10 @@ CREATE TABLE cadastre_object_historic (
 );
 
 
-ALTER TABLE cadastre.cadastre_object_historic OWNER TO postgres;
+ALTER TABLE cadastre_object_historic OWNER TO postgres;
 
 --
--- Name: cadastre_object_node_target; Type: TABLE; Schema: cadastre; Owner: postgres; Tablespace: 
+-- Name: cadastre_object_node_target; Type: TABLE; Schema: cadastre; Owner: postgres
 --
 
 CREATE TABLE cadastre_object_node_target (
@@ -8820,7 +8883,7 @@ CREATE TABLE cadastre_object_node_target (
 );
 
 
-ALTER TABLE cadastre.cadastre_object_node_target OWNER TO postgres;
+ALTER TABLE cadastre_object_node_target OWNER TO postgres;
 
 --
 -- Name: TABLE cadastre_object_node_target; Type: COMMENT; Schema: cadastre; Owner: postgres
@@ -8887,7 +8950,7 @@ COMMENT ON COLUMN cadastre_object_node_target.change_time IS 'The date and time 
 
 
 --
--- Name: cadastre_object_node_target_historic; Type: TABLE; Schema: cadastre; Owner: postgres; Tablespace: 
+-- Name: cadastre_object_node_target_historic; Type: TABLE; Schema: cadastre; Owner: postgres
 --
 
 CREATE TABLE cadastre_object_node_target_historic (
@@ -8907,10 +8970,10 @@ CREATE TABLE cadastre_object_node_target_historic (
 );
 
 
-ALTER TABLE cadastre.cadastre_object_node_target_historic OWNER TO postgres;
+ALTER TABLE cadastre_object_node_target_historic OWNER TO postgres;
 
 --
--- Name: cadastre_object_target; Type: TABLE; Schema: cadastre; Owner: postgres; Tablespace: 
+-- Name: cadastre_object_target; Type: TABLE; Schema: cadastre; Owner: postgres
 --
 
 CREATE TABLE cadastre_object_target (
@@ -8929,7 +8992,7 @@ CREATE TABLE cadastre_object_target (
 );
 
 
-ALTER TABLE cadastre.cadastre_object_target OWNER TO postgres;
+ALTER TABLE cadastre_object_target OWNER TO postgres;
 
 --
 -- Name: TABLE cadastre_object_target; Type: COMMENT; Schema: cadastre; Owner: postgres
@@ -8996,7 +9059,7 @@ COMMENT ON COLUMN cadastre_object_target.change_time IS 'The date and time the r
 
 
 --
--- Name: cadastre_object_target_historic; Type: TABLE; Schema: cadastre; Owner: postgres; Tablespace: 
+-- Name: cadastre_object_target_historic; Type: TABLE; Schema: cadastre; Owner: postgres
 --
 
 CREATE TABLE cadastre_object_target_historic (
@@ -9016,10 +9079,10 @@ CREATE TABLE cadastre_object_target_historic (
 );
 
 
-ALTER TABLE cadastre.cadastre_object_target_historic OWNER TO postgres;
+ALTER TABLE cadastre_object_target_historic OWNER TO postgres;
 
 --
--- Name: cadastre_object_type; Type: TABLE; Schema: cadastre; Owner: postgres; Tablespace: 
+-- Name: cadastre_object_type; Type: TABLE; Schema: cadastre; Owner: postgres
 --
 
 CREATE TABLE cadastre_object_type (
@@ -9031,7 +9094,7 @@ CREATE TABLE cadastre_object_type (
 );
 
 
-ALTER TABLE cadastre.cadastre_object_type OWNER TO postgres;
+ALTER TABLE cadastre_object_type OWNER TO postgres;
 
 --
 -- Name: TABLE cadastre_object_type; Type: COMMENT; Schema: cadastre; Owner: postgres
@@ -9077,7 +9140,7 @@ COMMENT ON COLUMN cadastre_object_type.in_topology IS 'Flag to indicate that all
 
 
 --
--- Name: dimension_type; Type: TABLE; Schema: cadastre; Owner: postgres; Tablespace: 
+-- Name: dimension_type; Type: TABLE; Schema: cadastre; Owner: postgres
 --
 
 CREATE TABLE dimension_type (
@@ -9088,7 +9151,7 @@ CREATE TABLE dimension_type (
 );
 
 
-ALTER TABLE cadastre.dimension_type OWNER TO postgres;
+ALTER TABLE dimension_type OWNER TO postgres;
 
 --
 -- Name: TABLE dimension_type; Type: COMMENT; Schema: cadastre; Owner: postgres
@@ -9127,7 +9190,7 @@ COMMENT ON COLUMN dimension_type.status IS 'SOLA Extension: Status of the dimens
 
 
 --
--- Name: spatial_unit_group; Type: TABLE; Schema: cadastre; Owner: postgres; Tablespace: 
+-- Name: spatial_unit_group; Type: TABLE; Schema: cadastre; Owner: postgres
 --
 
 CREATE TABLE spatial_unit_group (
@@ -9155,7 +9218,7 @@ CREATE TABLE spatial_unit_group (
 );
 
 
-ALTER TABLE cadastre.spatial_unit_group OWNER TO postgres;
+ALTER TABLE spatial_unit_group OWNER TO postgres;
 
 --
 -- Name: TABLE spatial_unit_group; Type: COMMENT; Schema: cadastre; Owner: postgres
@@ -9262,10 +9325,14 @@ COMMENT ON COLUMN spatial_unit_group.change_time IS 'SOLA Extension: The date an
 --
 
 CREATE VIEW hierarchy AS
-    SELECT sug.id, sug.label, sug.geom, (sug.hierarchy_level)::character varying AS filter_category FROM spatial_unit_group sug;
+ SELECT sug.id,
+    sug.label,
+    sug.geom,
+    (sug.hierarchy_level)::character varying AS filter_category
+   FROM spatial_unit_group sug;
 
 
-ALTER TABLE cadastre.hierarchy OWNER TO postgres;
+ALTER TABLE hierarchy OWNER TO postgres;
 
 --
 -- Name: VIEW hierarchy; Type: COMMENT; Schema: cadastre; Owner: postgres
@@ -9275,7 +9342,7 @@ COMMENT ON VIEW hierarchy IS 'First (highest) level of the hierarchical spatial 
 
 
 --
--- Name: hierarchy_level; Type: TABLE; Schema: cadastre; Owner: postgres; Tablespace: 
+-- Name: hierarchy_level; Type: TABLE; Schema: cadastre; Owner: postgres
 --
 
 CREATE TABLE hierarchy_level (
@@ -9286,7 +9353,7 @@ CREATE TABLE hierarchy_level (
 );
 
 
-ALTER TABLE cadastre.hierarchy_level OWNER TO postgres;
+ALTER TABLE hierarchy_level OWNER TO postgres;
 
 --
 -- Name: TABLE hierarchy_level; Type: COMMENT; Schema: cadastre; Owner: postgres
@@ -9325,7 +9392,7 @@ COMMENT ON COLUMN hierarchy_level.status IS 'Status of the hierarchy level';
 
 
 --
--- Name: legal_space_utility_network; Type: TABLE; Schema: cadastre; Owner: postgres; Tablespace: 
+-- Name: legal_space_utility_network; Type: TABLE; Schema: cadastre; Owner: postgres
 --
 
 CREATE TABLE legal_space_utility_network (
@@ -9345,7 +9412,7 @@ CREATE TABLE legal_space_utility_network (
 );
 
 
-ALTER TABLE cadastre.legal_space_utility_network OWNER TO postgres;
+ALTER TABLE legal_space_utility_network OWNER TO postgres;
 
 --
 -- Name: TABLE legal_space_utility_network; Type: COMMENT; Schema: cadastre; Owner: postgres
@@ -9426,7 +9493,7 @@ COMMENT ON COLUMN legal_space_utility_network.change_time IS 'SOLA Extension: Th
 
 
 --
--- Name: legal_space_utility_network_historic; Type: TABLE; Schema: cadastre; Owner: postgres; Tablespace: 
+-- Name: legal_space_utility_network_historic; Type: TABLE; Schema: cadastre; Owner: postgres
 --
 
 CREATE TABLE legal_space_utility_network_historic (
@@ -9447,10 +9514,10 @@ CREATE TABLE legal_space_utility_network_historic (
 );
 
 
-ALTER TABLE cadastre.legal_space_utility_network_historic OWNER TO postgres;
+ALTER TABLE legal_space_utility_network_historic OWNER TO postgres;
 
 --
--- Name: level; Type: TABLE; Schema: cadastre; Owner: postgres; Tablespace: 
+-- Name: level; Type: TABLE; Schema: cadastre; Owner: postgres
 --
 
 CREATE TABLE level (
@@ -9468,7 +9535,7 @@ CREATE TABLE level (
 );
 
 
-ALTER TABLE cadastre.level OWNER TO postgres;
+ALTER TABLE level OWNER TO postgres;
 
 --
 -- Name: TABLE level; Type: COMMENT; Schema: cadastre; Owner: postgres
@@ -9561,7 +9628,7 @@ COMMENT ON COLUMN level.editable IS 'It shows if the spatial units of this level
 
 
 --
--- Name: level_config_map_layer; Type: TABLE; Schema: cadastre; Owner: postgres; Tablespace: 
+-- Name: level_config_map_layer; Type: TABLE; Schema: cadastre; Owner: postgres
 --
 
 CREATE TABLE level_config_map_layer (
@@ -9570,7 +9637,7 @@ CREATE TABLE level_config_map_layer (
 );
 
 
-ALTER TABLE cadastre.level_config_map_layer OWNER TO postgres;
+ALTER TABLE level_config_map_layer OWNER TO postgres;
 
 --
 -- Name: TABLE level_config_map_layer; Type: COMMENT; Schema: cadastre; Owner: postgres
@@ -9580,7 +9647,7 @@ COMMENT ON TABLE level_config_map_layer IS 'It provides for each level which lay
 
 
 --
--- Name: level_content_type; Type: TABLE; Schema: cadastre; Owner: postgres; Tablespace: 
+-- Name: level_content_type; Type: TABLE; Schema: cadastre; Owner: postgres
 --
 
 CREATE TABLE level_content_type (
@@ -9591,7 +9658,7 @@ CREATE TABLE level_content_type (
 );
 
 
-ALTER TABLE cadastre.level_content_type OWNER TO postgres;
+ALTER TABLE level_content_type OWNER TO postgres;
 
 --
 -- Name: TABLE level_content_type; Type: COMMENT; Schema: cadastre; Owner: postgres
@@ -9630,7 +9697,7 @@ COMMENT ON COLUMN level_content_type.status IS 'SOLA Extension: Status of the le
 
 
 --
--- Name: level_historic; Type: TABLE; Schema: cadastre; Owner: postgres; Tablespace: 
+-- Name: level_historic; Type: TABLE; Schema: cadastre; Owner: postgres
 --
 
 CREATE TABLE level_historic (
@@ -9649,7 +9716,7 @@ CREATE TABLE level_historic (
 );
 
 
-ALTER TABLE cadastre.level_historic OWNER TO postgres;
+ALTER TABLE level_historic OWNER TO postgres;
 
 --
 -- Name: COLUMN level_historic.editable; Type: COMMENT; Schema: cadastre; Owner: postgres
@@ -9659,7 +9726,7 @@ COMMENT ON COLUMN level_historic.editable IS 'It shows if the spatial units of t
 
 
 --
--- Name: spatial_unit; Type: TABLE; Schema: cadastre; Owner: postgres; Tablespace: 
+-- Name: spatial_unit; Type: TABLE; Schema: cadastre; Owner: postgres
 --
 
 CREATE TABLE spatial_unit (
@@ -9687,7 +9754,7 @@ CREATE TABLE spatial_unit (
 );
 
 
-ALTER TABLE cadastre.spatial_unit OWNER TO postgres;
+ALTER TABLE spatial_unit OWNER TO postgres;
 
 --
 -- Name: TABLE spatial_unit; Type: COMMENT; Schema: cadastre; Owner: postgres
@@ -9801,10 +9868,15 @@ COMMENT ON COLUMN spatial_unit.change_time IS 'SOLA Extension: The date and time
 --
 
 CREATE VIEW place_name AS
-    SELECT su.id, su.label, su.geom FROM level l, spatial_unit su WHERE (((l.id)::text = (su.level_id)::text) AND ((l.name)::text = 'Place Names'::text));
+ SELECT su.id,
+    su.label,
+    su.geom
+   FROM level l,
+    spatial_unit su
+  WHERE (((l.id)::text = (su.level_id)::text) AND ((l.name)::text = 'Place Names'::text));
 
 
-ALTER TABLE cadastre.place_name OWNER TO postgres;
+ALTER TABLE place_name OWNER TO postgres;
 
 --
 -- Name: VIEW place_name; Type: COMMENT; Schema: cadastre; Owner: postgres
@@ -9814,7 +9886,7 @@ COMMENT ON VIEW place_name IS 'View for retrieving place name features for displ
 
 
 --
--- Name: register_type; Type: TABLE; Schema: cadastre; Owner: postgres; Tablespace: 
+-- Name: register_type; Type: TABLE; Schema: cadastre; Owner: postgres
 --
 
 CREATE TABLE register_type (
@@ -9825,7 +9897,7 @@ CREATE TABLE register_type (
 );
 
 
-ALTER TABLE cadastre.register_type OWNER TO postgres;
+ALTER TABLE register_type OWNER TO postgres;
 
 --
 -- Name: TABLE register_type; Type: COMMENT; Schema: cadastre; Owner: postgres
@@ -9868,10 +9940,15 @@ COMMENT ON COLUMN register_type.status IS 'SOLA Extension: Status of the registe
 --
 
 CREATE VIEW road AS
-    SELECT su.id, su.label, su.geom FROM level l, spatial_unit su WHERE (((l.id)::text = (su.level_id)::text) AND ((l.name)::text = 'Roads'::text));
+ SELECT su.id,
+    su.label,
+    su.geom
+   FROM level l,
+    spatial_unit su
+  WHERE (((l.id)::text = (su.level_id)::text) AND ((l.name)::text = 'Roads'::text));
 
 
-ALTER TABLE cadastre.road OWNER TO postgres;
+ALTER TABLE road OWNER TO postgres;
 
 --
 -- Name: VIEW road; Type: COMMENT; Schema: cadastre; Owner: postgres
@@ -9881,7 +9958,7 @@ COMMENT ON VIEW road IS 'View for retrieving road and road centreline features f
 
 
 --
--- Name: spatial_unit_address; Type: TABLE; Schema: cadastre; Owner: postgres; Tablespace: 
+-- Name: spatial_unit_address; Type: TABLE; Schema: cadastre; Owner: postgres
 --
 
 CREATE TABLE spatial_unit_address (
@@ -9895,7 +9972,7 @@ CREATE TABLE spatial_unit_address (
 );
 
 
-ALTER TABLE cadastre.spatial_unit_address OWNER TO postgres;
+ALTER TABLE spatial_unit_address OWNER TO postgres;
 
 --
 -- Name: TABLE spatial_unit_address; Type: COMMENT; Schema: cadastre; Owner: postgres
@@ -9955,7 +10032,7 @@ COMMENT ON COLUMN spatial_unit_address.change_time IS 'The date and time the row
 
 
 --
--- Name: spatial_unit_address_historic; Type: TABLE; Schema: cadastre; Owner: postgres; Tablespace: 
+-- Name: spatial_unit_address_historic; Type: TABLE; Schema: cadastre; Owner: postgres
 --
 
 CREATE TABLE spatial_unit_address_historic (
@@ -9970,10 +10047,10 @@ CREATE TABLE spatial_unit_address_historic (
 );
 
 
-ALTER TABLE cadastre.spatial_unit_address_historic OWNER TO postgres;
+ALTER TABLE spatial_unit_address_historic OWNER TO postgres;
 
 --
--- Name: spatial_unit_group_historic; Type: TABLE; Schema: cadastre; Owner: postgres; Tablespace: 
+-- Name: spatial_unit_group_historic; Type: TABLE; Schema: cadastre; Owner: postgres
 --
 
 CREATE TABLE spatial_unit_group_historic (
@@ -10002,10 +10079,10 @@ CREATE TABLE spatial_unit_group_historic (
 );
 
 
-ALTER TABLE cadastre.spatial_unit_group_historic OWNER TO postgres;
+ALTER TABLE spatial_unit_group_historic OWNER TO postgres;
 
 --
--- Name: spatial_unit_historic; Type: TABLE; Schema: cadastre; Owner: postgres; Tablespace: 
+-- Name: spatial_unit_historic; Type: TABLE; Schema: cadastre; Owner: postgres
 --
 
 CREATE TABLE spatial_unit_historic (
@@ -10034,10 +10111,10 @@ CREATE TABLE spatial_unit_historic (
 );
 
 
-ALTER TABLE cadastre.spatial_unit_historic OWNER TO postgres;
+ALTER TABLE spatial_unit_historic OWNER TO postgres;
 
 --
--- Name: spatial_unit_in_group; Type: TABLE; Schema: cadastre; Owner: postgres; Tablespace: 
+-- Name: spatial_unit_in_group; Type: TABLE; Schema: cadastre; Owner: postgres
 --
 
 CREATE TABLE spatial_unit_in_group (
@@ -10051,7 +10128,7 @@ CREATE TABLE spatial_unit_in_group (
 );
 
 
-ALTER TABLE cadastre.spatial_unit_in_group OWNER TO postgres;
+ALTER TABLE spatial_unit_in_group OWNER TO postgres;
 
 --
 -- Name: TABLE spatial_unit_in_group; Type: COMMENT; Schema: cadastre; Owner: postgres
@@ -10112,7 +10189,7 @@ COMMENT ON COLUMN spatial_unit_in_group.change_time IS 'The date and time the ro
 
 
 --
--- Name: spatial_unit_in_group_historic; Type: TABLE; Schema: cadastre; Owner: postgres; Tablespace: 
+-- Name: spatial_unit_in_group_historic; Type: TABLE; Schema: cadastre; Owner: postgres
 --
 
 CREATE TABLE spatial_unit_in_group_historic (
@@ -10127,10 +10204,10 @@ CREATE TABLE spatial_unit_in_group_historic (
 );
 
 
-ALTER TABLE cadastre.spatial_unit_in_group_historic OWNER TO postgres;
+ALTER TABLE spatial_unit_in_group_historic OWNER TO postgres;
 
 --
--- Name: spatial_value_area_historic; Type: TABLE; Schema: cadastre; Owner: postgres; Tablespace: 
+-- Name: spatial_value_area_historic; Type: TABLE; Schema: cadastre; Owner: postgres
 --
 
 CREATE TABLE spatial_value_area_historic (
@@ -10146,10 +10223,10 @@ CREATE TABLE spatial_value_area_historic (
 );
 
 
-ALTER TABLE cadastre.spatial_value_area_historic OWNER TO postgres;
+ALTER TABLE spatial_value_area_historic OWNER TO postgres;
 
 --
--- Name: structure_type; Type: TABLE; Schema: cadastre; Owner: postgres; Tablespace: 
+-- Name: structure_type; Type: TABLE; Schema: cadastre; Owner: postgres
 --
 
 CREATE TABLE structure_type (
@@ -10160,7 +10237,7 @@ CREATE TABLE structure_type (
 );
 
 
-ALTER TABLE cadastre.structure_type OWNER TO postgres;
+ALTER TABLE structure_type OWNER TO postgres;
 
 --
 -- Name: TABLE structure_type; Type: COMMENT; Schema: cadastre; Owner: postgres
@@ -10199,7 +10276,7 @@ COMMENT ON COLUMN structure_type.status IS 'SOLA Extension: Status of the struct
 
 
 --
--- Name: surface_relation_type; Type: TABLE; Schema: cadastre; Owner: postgres; Tablespace: 
+-- Name: surface_relation_type; Type: TABLE; Schema: cadastre; Owner: postgres
 --
 
 CREATE TABLE surface_relation_type (
@@ -10210,7 +10287,7 @@ CREATE TABLE surface_relation_type (
 );
 
 
-ALTER TABLE cadastre.surface_relation_type OWNER TO postgres;
+ALTER TABLE surface_relation_type OWNER TO postgres;
 
 --
 -- Name: TABLE surface_relation_type; Type: COMMENT; Schema: cadastre; Owner: postgres
@@ -10253,10 +10330,15 @@ COMMENT ON COLUMN surface_relation_type.status IS 'SOLA Extension: Status of the
 --
 
 CREATE VIEW survey_control AS
-    SELECT su.id, su.label, su.geom FROM level l, spatial_unit su WHERE (((l.id)::text = (su.level_id)::text) AND ((l.name)::text = 'Survey Control'::text));
+ SELECT su.id,
+    su.label,
+    su.geom
+   FROM level l,
+    spatial_unit su
+  WHERE (((l.id)::text = (su.level_id)::text) AND ((l.name)::text = 'Survey Control'::text));
 
 
-ALTER TABLE cadastre.survey_control OWNER TO postgres;
+ALTER TABLE survey_control OWNER TO postgres;
 
 --
 -- Name: VIEW survey_control; Type: COMMENT; Schema: cadastre; Owner: postgres
@@ -10266,7 +10348,7 @@ COMMENT ON VIEW survey_control IS 'View for retrieving survey control features f
 
 
 --
--- Name: survey_point; Type: TABLE; Schema: cadastre; Owner: postgres; Tablespace: 
+-- Name: survey_point; Type: TABLE; Schema: cadastre; Owner: postgres
 --
 
 CREATE TABLE survey_point (
@@ -10292,7 +10374,7 @@ CREATE TABLE survey_point (
 );
 
 
-ALTER TABLE cadastre.survey_point OWNER TO postgres;
+ALTER TABLE survey_point OWNER TO postgres;
 
 --
 -- Name: TABLE survey_point; Type: COMMENT; Schema: cadastre; Owner: postgres
@@ -10380,7 +10462,7 @@ COMMENT ON COLUMN survey_point.change_time IS 'The date and time the row was las
 
 
 --
--- Name: survey_point_historic; Type: TABLE; Schema: cadastre; Owner: postgres; Tablespace: 
+-- Name: survey_point_historic; Type: TABLE; Schema: cadastre; Owner: postgres
 --
 
 CREATE TABLE survey_point_historic (
@@ -10407,10 +10489,10 @@ CREATE TABLE survey_point_historic (
 );
 
 
-ALTER TABLE cadastre.survey_point_historic OWNER TO postgres;
+ALTER TABLE survey_point_historic OWNER TO postgres;
 
 --
--- Name: utility_network_status_type; Type: TABLE; Schema: cadastre; Owner: postgres; Tablespace: 
+-- Name: utility_network_status_type; Type: TABLE; Schema: cadastre; Owner: postgres
 --
 
 CREATE TABLE utility_network_status_type (
@@ -10421,7 +10503,7 @@ CREATE TABLE utility_network_status_type (
 );
 
 
-ALTER TABLE cadastre.utility_network_status_type OWNER TO postgres;
+ALTER TABLE utility_network_status_type OWNER TO postgres;
 
 --
 -- Name: TABLE utility_network_status_type; Type: COMMENT; Schema: cadastre; Owner: postgres
@@ -10461,7 +10543,7 @@ COMMENT ON COLUMN utility_network_status_type.status IS 'SOLA Extension: Status 
 
 
 --
--- Name: utility_network_type; Type: TABLE; Schema: cadastre; Owner: postgres; Tablespace: 
+-- Name: utility_network_type; Type: TABLE; Schema: cadastre; Owner: postgres
 --
 
 CREATE TABLE utility_network_type (
@@ -10472,7 +10554,7 @@ CREATE TABLE utility_network_type (
 );
 
 
-ALTER TABLE cadastre.utility_network_type OWNER TO postgres;
+ALTER TABLE utility_network_type OWNER TO postgres;
 
 --
 -- Name: TABLE utility_network_type; Type: COMMENT; Schema: cadastre; Owner: postgres
@@ -10514,7 +10596,7 @@ COMMENT ON COLUMN utility_network_type.status IS 'SOLA Extension: Status of the 
 SET search_path = document, pg_catalog;
 
 --
--- Name: document; Type: TABLE; Schema: document; Owner: postgres; Tablespace: 
+-- Name: document; Type: TABLE; Schema: document; Owner: postgres
 --
 
 CREATE TABLE document (
@@ -10532,7 +10614,7 @@ CREATE TABLE document (
 );
 
 
-ALTER TABLE document.document OWNER TO postgres;
+ALTER TABLE document OWNER TO postgres;
 
 --
 -- Name: TABLE document; Type: COMMENT; Schema: document; Owner: postgres
@@ -10620,7 +10702,7 @@ COMMENT ON COLUMN document.change_time IS 'The date and time the row was last mo
 
 
 --
--- Name: document_chunk; Type: TABLE; Schema: document; Owner: postgres; Tablespace: 
+-- Name: document_chunk; Type: TABLE; Schema: document; Owner: postgres
 --
 
 CREATE TABLE document_chunk (
@@ -10636,7 +10718,7 @@ CREATE TABLE document_chunk (
 );
 
 
-ALTER TABLE document.document_chunk OWNER TO postgres;
+ALTER TABLE document_chunk OWNER TO postgres;
 
 --
 -- Name: TABLE document_chunk; Type: COMMENT; Schema: document; Owner: postgres
@@ -10709,7 +10791,7 @@ COMMENT ON COLUMN document_chunk.user_name IS 'User''s id (name), who has loaded
 
 
 --
--- Name: document_historic; Type: TABLE; Schema: document; Owner: postgres; Tablespace: 
+-- Name: document_historic; Type: TABLE; Schema: document; Owner: postgres
 --
 
 CREATE TABLE document_historic (
@@ -10728,7 +10810,7 @@ CREATE TABLE document_historic (
 );
 
 
-ALTER TABLE document.document_historic OWNER TO postgres;
+ALTER TABLE document_historic OWNER TO postgres;
 
 --
 -- Name: document_nr_seq; Type: SEQUENCE; Schema: document; Owner: postgres
@@ -10743,7 +10825,7 @@ CREATE SEQUENCE document_nr_seq
     CYCLE;
 
 
-ALTER TABLE document.document_nr_seq OWNER TO postgres;
+ALTER TABLE document_nr_seq OWNER TO postgres;
 
 --
 -- Name: SEQUENCE document_nr_seq; Type: COMMENT; Schema: document; Owner: postgres
@@ -10755,7 +10837,7 @@ COMMENT ON SEQUENCE document_nr_seq IS 'Sequence number used as the basis for th
 SET search_path = party, pg_catalog;
 
 --
--- Name: communication_type; Type: TABLE; Schema: party; Owner: postgres; Tablespace: 
+-- Name: communication_type; Type: TABLE; Schema: party; Owner: postgres
 --
 
 CREATE TABLE communication_type (
@@ -10766,7 +10848,7 @@ CREATE TABLE communication_type (
 );
 
 
-ALTER TABLE party.communication_type OWNER TO postgres;
+ALTER TABLE communication_type OWNER TO postgres;
 
 --
 -- Name: TABLE communication_type; Type: COMMENT; Schema: party; Owner: postgres
@@ -10805,7 +10887,7 @@ COMMENT ON COLUMN communication_type.description IS 'Description of the communic
 
 
 --
--- Name: gender_type; Type: TABLE; Schema: party; Owner: postgres; Tablespace: 
+-- Name: gender_type; Type: TABLE; Schema: party; Owner: postgres
 --
 
 CREATE TABLE gender_type (
@@ -10816,7 +10898,7 @@ CREATE TABLE gender_type (
 );
 
 
-ALTER TABLE party.gender_type OWNER TO postgres;
+ALTER TABLE gender_type OWNER TO postgres;
 
 --
 -- Name: TABLE gender_type; Type: COMMENT; Schema: party; Owner: postgres
@@ -10855,7 +10937,81 @@ COMMENT ON COLUMN gender_type.description IS 'Description of the gender type.';
 
 
 --
--- Name: group_party_historic; Type: TABLE; Schema: party; Owner: postgres; Tablespace: 
+-- Name: group_party; Type: TABLE; Schema: party; Owner: postgres
+--
+
+CREATE TABLE group_party (
+    id character varying(40) NOT NULL,
+    type_code character varying(20) NOT NULL,
+    rowidentifier character varying(40) DEFAULT public.uuid_generate_v1() NOT NULL,
+    rowversion integer DEFAULT 0 NOT NULL,
+    change_action character(1) DEFAULT 'i'::bpchar NOT NULL,
+    change_user character varying(50),
+    change_time timestamp without time zone DEFAULT now() NOT NULL
+);
+
+
+ALTER TABLE group_party OWNER TO postgres;
+
+--
+-- Name: TABLE group_party; Type: COMMENT; Schema: party; Owner: postgres
+--
+
+COMMENT ON TABLE group_party IS 'Groups any number of parties into a distinct entity. Implementation of the LADM LA_GroupParty class. Not used by SOLA
+Tags: LADM Reference Object, Change History, Not Used';
+
+
+--
+-- Name: COLUMN group_party.id; Type: COMMENT; Schema: party; Owner: postgres
+--
+
+COMMENT ON COLUMN group_party.id IS 'LADM Definition: Identifier for the group party.';
+
+
+--
+-- Name: COLUMN group_party.type_code; Type: COMMENT; Schema: party; Owner: postgres
+--
+
+COMMENT ON COLUMN group_party.type_code IS 'LADM Definition: The type of the group party. E.g. family, tribe, association, etc.';
+
+
+--
+-- Name: COLUMN group_party.rowidentifier; Type: COMMENT; Schema: party; Owner: postgres
+--
+
+COMMENT ON COLUMN group_party.rowidentifier IS 'SOLA Extension: Identifies the all change records for the row in the group_party_historic table';
+
+
+--
+-- Name: COLUMN group_party.rowversion; Type: COMMENT; Schema: party; Owner: postgres
+--
+
+COMMENT ON COLUMN group_party.rowversion IS 'SOLA Extension: Sequential value indicating the number of times this row has been modified.';
+
+
+--
+-- Name: COLUMN group_party.change_action; Type: COMMENT; Schema: party; Owner: postgres
+--
+
+COMMENT ON COLUMN group_party.change_action IS 'SOLA Extension: Indicates if the last data modification action that occurred to the row was insert (i), update (u) or delete (d).';
+
+
+--
+-- Name: COLUMN group_party.change_user; Type: COMMENT; Schema: party; Owner: postgres
+--
+
+COMMENT ON COLUMN group_party.change_user IS 'SOLA Extension: The user id of the last person to modify the row.';
+
+
+--
+-- Name: COLUMN group_party.change_time; Type: COMMENT; Schema: party; Owner: postgres
+--
+
+COMMENT ON COLUMN group_party.change_time IS 'SOLA Extension: The date and time the row was last modified.';
+
+
+--
+-- Name: group_party_historic; Type: TABLE; Schema: party; Owner: postgres
 --
 
 CREATE TABLE group_party_historic (
@@ -10870,10 +11026,10 @@ CREATE TABLE group_party_historic (
 );
 
 
-ALTER TABLE party.group_party_historic OWNER TO postgres;
+ALTER TABLE group_party_historic OWNER TO postgres;
 
 --
--- Name: group_party_type; Type: TABLE; Schema: party; Owner: postgres; Tablespace: 
+-- Name: group_party_type; Type: TABLE; Schema: party; Owner: postgres
 --
 
 CREATE TABLE group_party_type (
@@ -10884,7 +11040,7 @@ CREATE TABLE group_party_type (
 );
 
 
-ALTER TABLE party.group_party_type OWNER TO postgres;
+ALTER TABLE group_party_type OWNER TO postgres;
 
 --
 -- Name: TABLE group_party_type; Type: COMMENT; Schema: party; Owner: postgres
@@ -10923,7 +11079,7 @@ COMMENT ON COLUMN group_party_type.description IS 'LADM Definition: Description 
 
 
 --
--- Name: id_type; Type: TABLE; Schema: party; Owner: postgres; Tablespace: 
+-- Name: id_type; Type: TABLE; Schema: party; Owner: postgres
 --
 
 CREATE TABLE id_type (
@@ -10934,7 +11090,7 @@ CREATE TABLE id_type (
 );
 
 
-ALTER TABLE party.id_type OWNER TO postgres;
+ALTER TABLE id_type OWNER TO postgres;
 
 --
 -- Name: TABLE id_type; Type: COMMENT; Schema: party; Owner: postgres
@@ -10973,7 +11129,7 @@ COMMENT ON COLUMN id_type.description IS 'Description of the id type.';
 
 
 --
--- Name: party_historic; Type: TABLE; Schema: party; Owner: postgres; Tablespace: 
+-- Name: party_historic; Type: TABLE; Schema: party; Owner: postgres
 --
 
 CREATE TABLE party_historic (
@@ -11006,10 +11162,92 @@ CREATE TABLE party_historic (
 );
 
 
-ALTER TABLE party.party_historic OWNER TO postgres;
+ALTER TABLE party_historic OWNER TO postgres;
 
 --
--- Name: party_member_historic; Type: TABLE; Schema: party; Owner: postgres; Tablespace: 
+-- Name: party_member; Type: TABLE; Schema: party; Owner: postgres
+--
+
+CREATE TABLE party_member (
+    party_id character varying(40) NOT NULL,
+    group_id character varying(40) NOT NULL,
+    share double precision,
+    rowidentifier character varying(40) DEFAULT public.uuid_generate_v1() NOT NULL,
+    rowversion integer DEFAULT 0 NOT NULL,
+    change_action character(1) DEFAULT 'i'::bpchar NOT NULL,
+    change_user character varying(50),
+    change_time timestamp without time zone DEFAULT now() NOT NULL
+);
+
+
+ALTER TABLE party_member OWNER TO postgres;
+
+--
+-- Name: TABLE party_member; Type: COMMENT; Schema: party; Owner: postgres
+--
+
+COMMENT ON TABLE party_member IS 'Identifies the parties belonging to a group party. Implementation of the LADM LA_PartyMember class. Not used by SOLA.
+Tags: LADM Reference Object, Change History, Not Used';
+
+
+--
+-- Name: COLUMN party_member.party_id; Type: COMMENT; Schema: party; Owner: postgres
+--
+
+COMMENT ON COLUMN party_member.party_id IS 'LADM Definition: Identifier for the party.';
+
+
+--
+-- Name: COLUMN party_member.group_id; Type: COMMENT; Schema: party; Owner: postgres
+--
+
+COMMENT ON COLUMN party_member.group_id IS 'LADM Definition: Identifier of the group party';
+
+
+--
+-- Name: COLUMN party_member.share; Type: COMMENT; Schema: party; Owner: postgres
+--
+
+COMMENT ON COLUMN party_member.share IS 'LADM Definition: The share of a RRR held by a party member expressed as a fraction with a numerator and a denominator.';
+
+
+--
+-- Name: COLUMN party_member.rowidentifier; Type: COMMENT; Schema: party; Owner: postgres
+--
+
+COMMENT ON COLUMN party_member.rowidentifier IS 'SOLA Extension: Identifies the all change records for the row in the party_member_historic table';
+
+
+--
+-- Name: COLUMN party_member.rowversion; Type: COMMENT; Schema: party; Owner: postgres
+--
+
+COMMENT ON COLUMN party_member.rowversion IS 'SOLA Extension: Sequential value indicating the number of times this row has been modified.';
+
+
+--
+-- Name: COLUMN party_member.change_action; Type: COMMENT; Schema: party; Owner: postgres
+--
+
+COMMENT ON COLUMN party_member.change_action IS 'SOLA Extension: Indicates if the last data modification action that occurred to the row was insert (i), update (u) or delete (d).';
+
+
+--
+-- Name: COLUMN party_member.change_user; Type: COMMENT; Schema: party; Owner: postgres
+--
+
+COMMENT ON COLUMN party_member.change_user IS 'SOLA Extension: The user id of the last person to modify the row.';
+
+
+--
+-- Name: COLUMN party_member.change_time; Type: COMMENT; Schema: party; Owner: postgres
+--
+
+COMMENT ON COLUMN party_member.change_time IS 'SOLA Extension: The date and time the row was last modified.';
+
+
+--
+-- Name: party_member_historic; Type: TABLE; Schema: party; Owner: postgres
 --
 
 CREATE TABLE party_member_historic (
@@ -11025,10 +11263,10 @@ CREATE TABLE party_member_historic (
 );
 
 
-ALTER TABLE party.party_member_historic OWNER TO postgres;
+ALTER TABLE party_member_historic OWNER TO postgres;
 
 --
--- Name: party_role; Type: TABLE; Schema: party; Owner: postgres; Tablespace: 
+-- Name: party_role; Type: TABLE; Schema: party; Owner: postgres
 --
 
 CREATE TABLE party_role (
@@ -11042,7 +11280,7 @@ CREATE TABLE party_role (
 );
 
 
-ALTER TABLE party.party_role OWNER TO postgres;
+ALTER TABLE party_role OWNER TO postgres;
 
 --
 -- Name: TABLE party_role; Type: COMMENT; Schema: party; Owner: postgres
@@ -11102,7 +11340,7 @@ COMMENT ON COLUMN party_role.change_time IS 'SOLA Extension: The date and time t
 
 
 --
--- Name: party_role_historic; Type: TABLE; Schema: party; Owner: postgres; Tablespace: 
+-- Name: party_role_historic; Type: TABLE; Schema: party; Owner: postgres
 --
 
 CREATE TABLE party_role_historic (
@@ -11117,10 +11355,10 @@ CREATE TABLE party_role_historic (
 );
 
 
-ALTER TABLE party.party_role_historic OWNER TO postgres;
+ALTER TABLE party_role_historic OWNER TO postgres;
 
 --
--- Name: party_role_type; Type: TABLE; Schema: party; Owner: postgres; Tablespace: 
+-- Name: party_role_type; Type: TABLE; Schema: party; Owner: postgres
 --
 
 CREATE TABLE party_role_type (
@@ -11131,7 +11369,7 @@ CREATE TABLE party_role_type (
 );
 
 
-ALTER TABLE party.party_role_type OWNER TO postgres;
+ALTER TABLE party_role_type OWNER TO postgres;
 
 --
 -- Name: TABLE party_role_type; Type: COMMENT; Schema: party; Owner: postgres
@@ -11170,7 +11408,7 @@ COMMENT ON COLUMN party_role_type.description IS 'Description of the party role 
 
 
 --
--- Name: party_type; Type: TABLE; Schema: party; Owner: postgres; Tablespace: 
+-- Name: party_type; Type: TABLE; Schema: party; Owner: postgres
 --
 
 CREATE TABLE party_type (
@@ -11181,7 +11419,7 @@ CREATE TABLE party_type (
 );
 
 
-ALTER TABLE party.party_type OWNER TO postgres;
+ALTER TABLE party_type OWNER TO postgres;
 
 --
 -- Name: TABLE party_type; Type: COMMENT; Schema: party; Owner: postgres
@@ -11220,7 +11458,7 @@ COMMENT ON COLUMN party_type.description IS 'LADM Definition: Description of the
 
 
 --
--- Name: source_describes_party; Type: TABLE; Schema: party; Owner: postgres; Tablespace: 
+-- Name: source_describes_party; Type: TABLE; Schema: party; Owner: postgres
 --
 
 CREATE TABLE source_describes_party (
@@ -11234,7 +11472,7 @@ CREATE TABLE source_describes_party (
 );
 
 
-ALTER TABLE party.source_describes_party OWNER TO postgres;
+ALTER TABLE source_describes_party OWNER TO postgres;
 
 --
 -- Name: TABLE source_describes_party; Type: COMMENT; Schema: party; Owner: postgres
@@ -11249,7 +11487,7 @@ Not Defined';
 
 
 --
--- Name: source_describes_party_historic; Type: TABLE; Schema: party; Owner: postgres; Tablespace: 
+-- Name: source_describes_party_historic; Type: TABLE; Schema: party; Owner: postgres
 --
 
 CREATE TABLE source_describes_party_historic (
@@ -11264,12 +11502,12 @@ CREATE TABLE source_describes_party_historic (
 );
 
 
-ALTER TABLE party.source_describes_party_historic OWNER TO postgres;
+ALTER TABLE source_describes_party_historic OWNER TO postgres;
 
 SET search_path = source, pg_catalog;
 
 --
--- Name: administrative_source_type; Type: TABLE; Schema: source; Owner: postgres; Tablespace: 
+-- Name: administrative_source_type; Type: TABLE; Schema: source; Owner: postgres
 --
 
 CREATE TABLE administrative_source_type (
@@ -11281,7 +11519,7 @@ CREATE TABLE administrative_source_type (
 );
 
 
-ALTER TABLE source.administrative_source_type OWNER TO postgres;
+ALTER TABLE administrative_source_type OWNER TO postgres;
 
 --
 -- Name: TABLE administrative_source_type; Type: COMMENT; Schema: source; Owner: postgres
@@ -11328,7 +11566,7 @@ COMMENT ON COLUMN administrative_source_type.is_for_registration IS 'SOLA Extens
 
 
 --
--- Name: archive; Type: TABLE; Schema: source; Owner: postgres; Tablespace: 
+-- Name: archive; Type: TABLE; Schema: source; Owner: postgres
 --
 
 CREATE TABLE archive (
@@ -11342,7 +11580,7 @@ CREATE TABLE archive (
 );
 
 
-ALTER TABLE source.archive OWNER TO postgres;
+ALTER TABLE archive OWNER TO postgres;
 
 --
 -- Name: TABLE archive; Type: COMMENT; Schema: source; Owner: postgres
@@ -11402,7 +11640,7 @@ COMMENT ON COLUMN archive.change_time IS 'The date and time the row was last mod
 
 
 --
--- Name: archive_historic; Type: TABLE; Schema: source; Owner: postgres; Tablespace: 
+-- Name: archive_historic; Type: TABLE; Schema: source; Owner: postgres
 --
 
 CREATE TABLE archive_historic (
@@ -11417,10 +11655,10 @@ CREATE TABLE archive_historic (
 );
 
 
-ALTER TABLE source.archive_historic OWNER TO postgres;
+ALTER TABLE archive_historic OWNER TO postgres;
 
 --
--- Name: availability_status_type; Type: TABLE; Schema: source; Owner: postgres; Tablespace: 
+-- Name: availability_status_type; Type: TABLE; Schema: source; Owner: postgres
 --
 
 CREATE TABLE availability_status_type (
@@ -11431,7 +11669,7 @@ CREATE TABLE availability_status_type (
 );
 
 
-ALTER TABLE source.availability_status_type OWNER TO postgres;
+ALTER TABLE availability_status_type OWNER TO postgres;
 
 --
 -- Name: TABLE availability_status_type; Type: COMMENT; Schema: source; Owner: postgres
@@ -11470,7 +11708,7 @@ COMMENT ON COLUMN availability_status_type.description IS 'LADM Definition: Desc
 
 
 --
--- Name: power_of_attorney; Type: TABLE; Schema: source; Owner: postgres; Tablespace: 
+-- Name: power_of_attorney; Type: TABLE; Schema: source; Owner: postgres
 --
 
 CREATE TABLE power_of_attorney (
@@ -11485,7 +11723,7 @@ CREATE TABLE power_of_attorney (
 );
 
 
-ALTER TABLE source.power_of_attorney OWNER TO postgres;
+ALTER TABLE power_of_attorney OWNER TO postgres;
 
 --
 -- Name: TABLE power_of_attorney; Type: COMMENT; Schema: source; Owner: postgres
@@ -11552,7 +11790,7 @@ COMMENT ON COLUMN power_of_attorney.change_time IS 'The date and time the row wa
 
 
 --
--- Name: power_of_attorney_historic; Type: TABLE; Schema: source; Owner: postgres; Tablespace: 
+-- Name: power_of_attorney_historic; Type: TABLE; Schema: source; Owner: postgres
 --
 
 CREATE TABLE power_of_attorney_historic (
@@ -11568,10 +11806,10 @@ CREATE TABLE power_of_attorney_historic (
 );
 
 
-ALTER TABLE source.power_of_attorney_historic OWNER TO postgres;
+ALTER TABLE power_of_attorney_historic OWNER TO postgres;
 
 --
--- Name: presentation_form_type; Type: TABLE; Schema: source; Owner: postgres; Tablespace: 
+-- Name: presentation_form_type; Type: TABLE; Schema: source; Owner: postgres
 --
 
 CREATE TABLE presentation_form_type (
@@ -11582,7 +11820,7 @@ CREATE TABLE presentation_form_type (
 );
 
 
-ALTER TABLE source.presentation_form_type OWNER TO postgres;
+ALTER TABLE presentation_form_type OWNER TO postgres;
 
 --
 -- Name: TABLE presentation_form_type; Type: COMMENT; Schema: source; Owner: postgres
@@ -11621,7 +11859,7 @@ COMMENT ON COLUMN presentation_form_type.description IS 'LADM Definition: Descri
 
 
 --
--- Name: source; Type: TABLE; Schema: source; Owner: postgres; Tablespace: 
+-- Name: source; Type: TABLE; Schema: source; Owner: postgres
 --
 
 CREATE TABLE source (
@@ -11654,7 +11892,7 @@ CREATE TABLE source (
 );
 
 
-ALTER TABLE source.source OWNER TO postgres;
+ALTER TABLE source OWNER TO postgres;
 
 --
 -- Name: TABLE source; Type: COMMENT; Schema: source; Owner: postgres
@@ -11840,7 +12078,7 @@ COMMENT ON COLUMN source.redact_code IS 'FROM  SOLA State Land Extension: The re
 
 
 --
--- Name: source_historic; Type: TABLE; Schema: source; Owner: postgres; Tablespace: 
+-- Name: source_historic; Type: TABLE; Schema: source; Owner: postgres
 --
 
 CREATE TABLE source_historic (
@@ -11874,7 +12112,7 @@ CREATE TABLE source_historic (
 );
 
 
-ALTER TABLE source.source_historic OWNER TO postgres;
+ALTER TABLE source_historic OWNER TO postgres;
 
 --
 -- Name: source_la_nr_seq; Type: SEQUENCE; Schema: source; Owner: postgres
@@ -11889,7 +12127,7 @@ CREATE SEQUENCE source_la_nr_seq
     CYCLE;
 
 
-ALTER TABLE source.source_la_nr_seq OWNER TO postgres;
+ALTER TABLE source_la_nr_seq OWNER TO postgres;
 
 --
 -- Name: SEQUENCE source_la_nr_seq; Type: COMMENT; Schema: source; Owner: postgres
@@ -11899,7 +12137,7 @@ COMMENT ON SEQUENCE source_la_nr_seq IS 'Sequence number used as the basis for t
 
 
 --
--- Name: spatial_source; Type: TABLE; Schema: source; Owner: postgres; Tablespace: 
+-- Name: spatial_source; Type: TABLE; Schema: source; Owner: postgres
 --
 
 CREATE TABLE spatial_source (
@@ -11914,7 +12152,7 @@ CREATE TABLE spatial_source (
 );
 
 
-ALTER TABLE source.spatial_source OWNER TO postgres;
+ALTER TABLE spatial_source OWNER TO postgres;
 
 --
 -- Name: TABLE spatial_source; Type: COMMENT; Schema: source; Owner: postgres
@@ -11981,7 +12219,7 @@ COMMENT ON COLUMN spatial_source.change_time IS 'The date and time the row was l
 
 
 --
--- Name: spatial_source_historic; Type: TABLE; Schema: source; Owner: postgres; Tablespace: 
+-- Name: spatial_source_historic; Type: TABLE; Schema: source; Owner: postgres
 --
 
 CREATE TABLE spatial_source_historic (
@@ -11997,10 +12235,10 @@ CREATE TABLE spatial_source_historic (
 );
 
 
-ALTER TABLE source.spatial_source_historic OWNER TO postgres;
+ALTER TABLE spatial_source_historic OWNER TO postgres;
 
 --
--- Name: spatial_source_measurement; Type: TABLE; Schema: source; Owner: postgres; Tablespace: 
+-- Name: spatial_source_measurement; Type: TABLE; Schema: source; Owner: postgres
 --
 
 CREATE TABLE spatial_source_measurement (
@@ -12014,7 +12252,7 @@ CREATE TABLE spatial_source_measurement (
 );
 
 
-ALTER TABLE source.spatial_source_measurement OWNER TO postgres;
+ALTER TABLE spatial_source_measurement OWNER TO postgres;
 
 --
 -- Name: TABLE spatial_source_measurement; Type: COMMENT; Schema: source; Owner: postgres
@@ -12074,7 +12312,7 @@ COMMENT ON COLUMN spatial_source_measurement.change_time IS 'The date and time t
 
 
 --
--- Name: spatial_source_measurement_historic; Type: TABLE; Schema: source; Owner: postgres; Tablespace: 
+-- Name: spatial_source_measurement_historic; Type: TABLE; Schema: source; Owner: postgres
 --
 
 CREATE TABLE spatial_source_measurement_historic (
@@ -12089,10 +12327,10 @@ CREATE TABLE spatial_source_measurement_historic (
 );
 
 
-ALTER TABLE source.spatial_source_measurement_historic OWNER TO postgres;
+ALTER TABLE spatial_source_measurement_historic OWNER TO postgres;
 
 --
--- Name: spatial_source_type; Type: TABLE; Schema: source; Owner: postgres; Tablespace: 
+-- Name: spatial_source_type; Type: TABLE; Schema: source; Owner: postgres
 --
 
 CREATE TABLE spatial_source_type (
@@ -12103,7 +12341,7 @@ CREATE TABLE spatial_source_type (
 );
 
 
-ALTER TABLE source.spatial_source_type OWNER TO postgres;
+ALTER TABLE spatial_source_type OWNER TO postgres;
 
 --
 -- Name: TABLE spatial_source_type; Type: COMMENT; Schema: source; Owner: postgres
@@ -12144,7 +12382,7 @@ COMMENT ON COLUMN spatial_source_type.description IS 'LADM Definition: Descripti
 SET search_path = system, pg_catalog;
 
 --
--- Name: approle_appgroup; Type: TABLE; Schema: system; Owner: postgres; Tablespace: 
+-- Name: approle_appgroup; Type: TABLE; Schema: system; Owner: postgres
 --
 
 CREATE TABLE approle_appgroup (
@@ -12158,7 +12396,7 @@ CREATE TABLE approle_appgroup (
 );
 
 
-ALTER TABLE system.approle_appgroup OWNER TO postgres;
+ALTER TABLE approle_appgroup OWNER TO postgres;
 
 --
 -- Name: TABLE approle_appgroup; Type: COMMENT; Schema: system; Owner: postgres
@@ -12218,7 +12456,7 @@ COMMENT ON COLUMN approle_appgroup.change_time IS 'The date and time the row was
 
 
 --
--- Name: appuser; Type: TABLE; Schema: system; Owner: postgres; Tablespace: 
+-- Name: appuser; Type: TABLE; Schema: system; Owner: postgres
 --
 
 CREATE TABLE appuser (
@@ -12241,7 +12479,7 @@ CREATE TABLE appuser (
 );
 
 
-ALTER TABLE system.appuser OWNER TO postgres;
+ALTER TABLE appuser OWNER TO postgres;
 
 --
 -- Name: TABLE appuser; Type: COMMENT; Schema: system; Owner: postgres
@@ -12287,7 +12525,7 @@ COMMENT ON COLUMN appuser.activation_expiration IS 'Account activation timeout. 
 
 
 --
--- Name: appuser_appgroup; Type: TABLE; Schema: system; Owner: postgres; Tablespace: 
+-- Name: appuser_appgroup; Type: TABLE; Schema: system; Owner: postgres
 --
 
 CREATE TABLE appuser_appgroup (
@@ -12301,7 +12539,7 @@ CREATE TABLE appuser_appgroup (
 );
 
 
-ALTER TABLE system.appuser_appgroup OWNER TO postgres;
+ALTER TABLE appuser_appgroup OWNER TO postgres;
 
 --
 -- Name: TABLE appuser_appgroup; Type: COMMENT; Schema: system; Owner: postgres
@@ -12361,7 +12599,7 @@ COMMENT ON COLUMN appuser_appgroup.change_time IS 'The date and time the row was
 
 
 --
--- Name: appuser_historic; Type: TABLE; Schema: system; Owner: postgres; Tablespace: 
+-- Name: appuser_historic; Type: TABLE; Schema: system; Owner: postgres
 --
 
 CREATE TABLE appuser_historic (
@@ -12385,10 +12623,10 @@ CREATE TABLE appuser_historic (
 );
 
 
-ALTER TABLE system.appuser_historic OWNER TO postgres;
+ALTER TABLE appuser_historic OWNER TO postgres;
 
 --
--- Name: setting; Type: TABLE; Schema: system; Owner: postgres; Tablespace: 
+-- Name: setting; Type: TABLE; Schema: system; Owner: postgres
 --
 
 CREATE TABLE setting (
@@ -12399,7 +12637,7 @@ CREATE TABLE setting (
 );
 
 
-ALTER TABLE system.setting OWNER TO postgres;
+ALTER TABLE setting OWNER TO postgres;
 
 --
 -- Name: TABLE setting; Type: COMMENT; Schema: system; Owner: postgres
@@ -12442,10 +12680,14 @@ COMMENT ON COLUMN setting.description IS 'Description of the setting. ';
 --
 
 CREATE VIEW user_roles AS
-    SELECT u.username, rg.approle_code AS rolename FROM ((appuser u JOIN appuser_appgroup ug ON ((((u.id)::text = (ug.appuser_id)::text) AND u.active))) JOIN approle_appgroup rg ON (((ug.appgroup_id)::text = (rg.appgroup_id)::text)));
+ SELECT u.username,
+    rg.approle_code AS rolename
+   FROM ((appuser u
+     JOIN appuser_appgroup ug ON ((((u.id)::text = (ug.appuser_id)::text) AND u.active)))
+     JOIN approle_appgroup rg ON (((ug.appgroup_id)::text = (rg.appgroup_id)::text)));
 
 
-ALTER TABLE system.user_roles OWNER TO postgres;
+ALTER TABLE user_roles OWNER TO postgres;
 
 --
 -- Name: VIEW user_roles; Type: COMMENT; Schema: system; Owner: postgres
@@ -12459,10 +12701,51 @@ COMMENT ON VIEW user_roles IS 'Determines the application security roles assigne
 --
 
 CREATE VIEW user_pword_expiry AS
-    WITH pw_change_all AS (SELECT u.username, u.change_time, u.change_user, u.rowversion FROM appuser u WHERE (NOT (EXISTS (SELECT uh2.id FROM appuser_historic uh2 WHERE ((((uh2.username)::text = (u.username)::text) AND (uh2.rowversion = (u.rowversion - 1))) AND ((uh2.passwd)::text = (u.passwd)::text))))) UNION SELECT uh.username, uh.change_time, uh.change_user, uh.rowversion FROM appuser_historic uh WHERE (NOT (EXISTS (SELECT uh2.id FROM appuser_historic uh2 WHERE ((((uh2.username)::text = (uh.username)::text) AND (uh2.rowversion = (uh.rowversion - 1))) AND ((uh2.passwd)::text = (uh.passwd)::text)))))), pw_change AS (SELECT pall.username AS uname, pall.change_time AS last_pword_change, pall.change_user AS pword_change_user FROM pw_change_all pall WHERE (pall.rowversion = (SELECT max(p2.rowversion) AS max FROM pw_change_all p2 WHERE ((p2.username)::text = (pall.username)::text)))) SELECT p.uname, p.last_pword_change, p.pword_change_user, CASE WHEN (EXISTS (SELECT r.username FROM user_roles r WHERE (((r.username)::text = (p.uname)::text) AND ((r.rolename)::text = ANY (ARRAY[('ManageSecurity'::character varying)::text, ('NoPasswordExpiry'::character varying)::text]))))) THEN true ELSE false END AS no_pword_expiry, CASE WHEN (s.vl IS NULL) THEN NULL::integer ELSE (((p.last_pword_change)::date - (now())::date) + (s.vl)::integer) END AS pword_expiry_days FROM (pw_change p LEFT JOIN setting s ON ((((s.name)::text = 'pword-expiry-days'::text) AND s.active)));
+ WITH pw_change_all AS (
+         SELECT u.username,
+            u.change_time,
+            u.change_user,
+            u.rowversion
+           FROM appuser u
+          WHERE (NOT (EXISTS ( SELECT uh2.id
+                   FROM appuser_historic uh2
+                  WHERE (((uh2.username)::text = (u.username)::text) AND (uh2.rowversion = (u.rowversion - 1)) AND ((uh2.passwd)::text = (u.passwd)::text)))))
+        UNION
+         SELECT uh.username,
+            uh.change_time,
+            uh.change_user,
+            uh.rowversion
+           FROM appuser_historic uh
+          WHERE (NOT (EXISTS ( SELECT uh2.id
+                   FROM appuser_historic uh2
+                  WHERE (((uh2.username)::text = (uh.username)::text) AND (uh2.rowversion = (uh.rowversion - 1)) AND ((uh2.passwd)::text = (uh.passwd)::text)))))
+        ), pw_change AS (
+         SELECT pall.username AS uname,
+            pall.change_time AS last_pword_change,
+            pall.change_user AS pword_change_user
+           FROM pw_change_all pall
+          WHERE (pall.rowversion = ( SELECT max(p2.rowversion) AS max
+                   FROM pw_change_all p2
+                  WHERE ((p2.username)::text = (pall.username)::text)))
+        )
+ SELECT p.uname,
+    p.last_pword_change,
+    p.pword_change_user,
+        CASE
+            WHEN (EXISTS ( SELECT r.username
+               FROM user_roles r
+              WHERE (((r.username)::text = (p.uname)::text) AND ((r.rolename)::text = ANY (ARRAY[('ManageSecurity'::character varying)::text, ('NoPasswordExpiry'::character varying)::text]))))) THEN true
+            ELSE false
+        END AS no_pword_expiry,
+        CASE
+            WHEN (s.vl IS NULL) THEN NULL::integer
+            ELSE (((p.last_pword_change)::date - (now())::date) + (s.vl)::integer)
+        END AS pword_expiry_days
+   FROM (pw_change p
+     LEFT JOIN setting s ON ((((s.name)::text = 'pword-expiry-days'::text) AND s.active)));
 
 
-ALTER TABLE system.user_pword_expiry OWNER TO postgres;
+ALTER TABLE user_pword_expiry OWNER TO postgres;
 
 --
 -- Name: VIEW user_pword_expiry; Type: COMMENT; Schema: system; Owner: postgres
@@ -12476,10 +12759,14 @@ COMMENT ON VIEW user_pword_expiry IS 'Determines the number of days until the us
 --
 
 CREATE VIEW active_users AS
-    SELECT u.username, u.passwd FROM appuser u, user_pword_expiry ex WHERE (((u.active = true) AND ((ex.uname)::text = (u.username)::text)) AND ((COALESCE(ex.pword_expiry_days, 1) > 0) OR (ex.no_pword_expiry = true)));
+ SELECT u.username,
+    u.passwd
+   FROM appuser u,
+    user_pword_expiry ex
+  WHERE ((u.active = true) AND ((ex.uname)::text = (u.username)::text) AND ((COALESCE(ex.pword_expiry_days, 1) > 0) OR (ex.no_pword_expiry = true)));
 
 
-ALTER TABLE system.active_users OWNER TO postgres;
+ALTER TABLE active_users OWNER TO postgres;
 
 --
 -- Name: VIEW active_users; Type: COMMENT; Schema: system; Owner: postgres
@@ -12489,7 +12776,7 @@ COMMENT ON VIEW active_users IS 'Identifies the users currently active in the sy
 
 
 --
--- Name: appgroup; Type: TABLE; Schema: system; Owner: postgres; Tablespace: 
+-- Name: appgroup; Type: TABLE; Schema: system; Owner: postgres
 --
 
 CREATE TABLE appgroup (
@@ -12499,7 +12786,7 @@ CREATE TABLE appgroup (
 );
 
 
-ALTER TABLE system.appgroup OWNER TO postgres;
+ALTER TABLE appgroup OWNER TO postgres;
 
 --
 -- Name: TABLE appgroup; Type: COMMENT; Schema: system; Owner: postgres
@@ -12531,7 +12818,7 @@ COMMENT ON COLUMN appgroup.description IS 'Describes the purpose of the appgroup
 
 
 --
--- Name: approle; Type: TABLE; Schema: system; Owner: postgres; Tablespace: 
+-- Name: approle; Type: TABLE; Schema: system; Owner: postgres
 --
 
 CREATE TABLE approle (
@@ -12542,7 +12829,7 @@ CREATE TABLE approle (
 );
 
 
-ALTER TABLE system.approle OWNER TO postgres;
+ALTER TABLE approle OWNER TO postgres;
 
 --
 -- Name: TABLE approle; Type: COMMENT; Schema: system; Owner: postgres
@@ -12581,7 +12868,7 @@ COMMENT ON COLUMN approle.description IS 'Describes the purpose of the role and 
 
 
 --
--- Name: approle_appgroup_historic; Type: TABLE; Schema: system; Owner: postgres; Tablespace: 
+-- Name: approle_appgroup_historic; Type: TABLE; Schema: system; Owner: postgres
 --
 
 CREATE TABLE approle_appgroup_historic (
@@ -12596,10 +12883,10 @@ CREATE TABLE approle_appgroup_historic (
 );
 
 
-ALTER TABLE system.approle_appgroup_historic OWNER TO postgres;
+ALTER TABLE approle_appgroup_historic OWNER TO postgres;
 
 --
--- Name: appuser_appgroup_historic; Type: TABLE; Schema: system; Owner: postgres; Tablespace: 
+-- Name: appuser_appgroup_historic; Type: TABLE; Schema: system; Owner: postgres
 --
 
 CREATE TABLE appuser_appgroup_historic (
@@ -12614,10 +12901,10 @@ CREATE TABLE appuser_appgroup_historic (
 );
 
 
-ALTER TABLE system.appuser_appgroup_historic OWNER TO postgres;
+ALTER TABLE appuser_appgroup_historic OWNER TO postgres;
 
 --
--- Name: appuser_setting; Type: TABLE; Schema: system; Owner: postgres; Tablespace: 
+-- Name: appuser_setting; Type: TABLE; Schema: system; Owner: postgres
 --
 
 CREATE TABLE appuser_setting (
@@ -12628,7 +12915,7 @@ CREATE TABLE appuser_setting (
 );
 
 
-ALTER TABLE system.appuser_setting OWNER TO postgres;
+ALTER TABLE appuser_setting OWNER TO postgres;
 
 --
 -- Name: TABLE appuser_setting; Type: COMMENT; Schema: system; Owner: postgres
@@ -12667,7 +12954,7 @@ COMMENT ON COLUMN appuser_setting.active IS 'Flag to indicate if the setting is 
 
 
 --
--- Name: br; Type: TABLE; Schema: system; Owner: postgres; Tablespace: 
+-- Name: br; Type: TABLE; Schema: system; Owner: postgres
 --
 
 CREATE TABLE br (
@@ -12680,7 +12967,7 @@ CREATE TABLE br (
 );
 
 
-ALTER TABLE system.br OWNER TO postgres;
+ALTER TABLE br OWNER TO postgres;
 
 --
 -- Name: TABLE br; Type: COMMENT; Schema: system; Owner: postgres
@@ -12733,7 +13020,7 @@ COMMENT ON COLUMN br.technical_description IS 'A technical description of the bu
 
 
 --
--- Name: br_definition; Type: TABLE; Schema: system; Owner: postgres; Tablespace: 
+-- Name: br_definition; Type: TABLE; Schema: system; Owner: postgres
 --
 
 CREATE TABLE br_definition (
@@ -12744,7 +13031,7 @@ CREATE TABLE br_definition (
 );
 
 
-ALTER TABLE system.br_definition OWNER TO postgres;
+ALTER TABLE br_definition OWNER TO postgres;
 
 --
 -- Name: TABLE br_definition; Type: COMMENT; Schema: system; Owner: postgres
@@ -12787,10 +13074,16 @@ COMMENT ON COLUMN br_definition.body IS 'The definition of the rule. Either SQL 
 --
 
 CREATE VIEW br_current AS
-    SELECT b.id, b.technical_type_code, b.feedback, bd.body FROM (br b JOIN br_definition bd ON (((b.id)::text = (bd.br_id)::text))) WHERE ((now() >= bd.active_from) AND (now() <= bd.active_until));
+ SELECT b.id,
+    b.technical_type_code,
+    b.feedback,
+    bd.body
+   FROM (br b
+     JOIN br_definition bd ON (((b.id)::text = (bd.br_id)::text)))
+  WHERE ((now() >= bd.active_from) AND (now() <= bd.active_until));
 
 
-ALTER TABLE system.br_current OWNER TO postgres;
+ALTER TABLE br_current OWNER TO postgres;
 
 --
 -- Name: VIEW br_current; Type: COMMENT; Schema: system; Owner: postgres
@@ -12800,7 +13093,7 @@ COMMENT ON VIEW br_current IS 'Determines the currently active business rules ba
 
 
 --
--- Name: br_validation; Type: TABLE; Schema: system; Owner: postgres; Tablespace: 
+-- Name: br_validation; Type: TABLE; Schema: system; Owner: postgres
 --
 
 CREATE TABLE br_validation (
@@ -12814,15 +13107,15 @@ CREATE TABLE br_validation (
     target_rrr_type_code character varying(20),
     severity_code character varying(20) NOT NULL,
     order_of_execution integer DEFAULT 0 NOT NULL,
-    CONSTRAINT br_validation_application_moment_valid CHECK ((((target_code)::text <> 'application'::text) OR ((((target_code)::text = 'application'::text) AND (target_service_moment IS NULL)) AND (target_reg_moment IS NULL)))),
-    CONSTRAINT br_validation_reg_moment_valid CHECK ((((target_code)::text = ANY (ARRAY[('application'::character varying)::text, ('service'::character varying)::text])) OR ((((target_code)::text <> ALL (ARRAY[('application'::character varying)::text, ('service'::character varying)::text])) AND (target_service_moment IS NULL)) AND (target_application_moment IS NULL)))),
+    CONSTRAINT br_validation_application_moment_valid CHECK ((((target_code)::text <> 'application'::text) OR (((target_code)::text = 'application'::text) AND (target_service_moment IS NULL) AND (target_reg_moment IS NULL)))),
+    CONSTRAINT br_validation_reg_moment_valid CHECK ((((target_code)::text = ANY (ARRAY[('application'::character varying)::text, ('service'::character varying)::text])) OR (((target_code)::text <> ALL (ARRAY[('application'::character varying)::text, ('service'::character varying)::text])) AND (target_service_moment IS NULL) AND (target_application_moment IS NULL)))),
     CONSTRAINT br_validation_rrr_rrr_type_valid CHECK (((target_rrr_type_code IS NULL) OR ((target_rrr_type_code IS NOT NULL) AND ((target_code)::text = 'rrr'::text)))),
-    CONSTRAINT br_validation_service_moment_valid CHECK ((((target_code)::text <> 'service'::text) OR ((((target_code)::text = 'service'::text) AND (target_application_moment IS NULL)) AND (target_reg_moment IS NULL)))),
+    CONSTRAINT br_validation_service_moment_valid CHECK ((((target_code)::text <> 'service'::text) OR (((target_code)::text = 'service'::text) AND (target_application_moment IS NULL) AND (target_reg_moment IS NULL)))),
     CONSTRAINT br_validation_service_request_type_valid CHECK (((target_request_type_code IS NULL) OR ((target_request_type_code IS NOT NULL) AND ((target_code)::text <> 'application'::text))))
 );
 
 
-ALTER TABLE system.br_validation OWNER TO postgres;
+ALTER TABLE br_validation OWNER TO postgres;
 
 --
 -- Name: TABLE br_validation; Type: COMMENT; Schema: system; Owner: postgres
@@ -12907,10 +13200,29 @@ COMMENT ON COLUMN br_validation.order_of_execution IS 'Number used to order the 
 --
 
 CREATE VIEW br_report AS
-    SELECT b.id, b.technical_type_code, b.feedback, b.description, CASE WHEN ((bv.target_code)::text = 'application'::text) THEN bv.target_application_moment WHEN ((bv.target_code)::text = 'service'::text) THEN bv.target_service_moment ELSE bv.target_reg_moment END AS moment_code, bd.body, bv.severity_code, bv.target_code, bv.target_request_type_code, bv.target_rrr_type_code, bv.order_of_execution FROM ((br b LEFT JOIN br_validation bv ON (((b.id)::text = (bv.br_id)::text))) JOIN br_definition bd ON (((b.id)::text = (bd.br_id)::text))) WHERE ((now() >= bd.active_from) AND (now() <= bd.active_until)) ORDER BY b.id;
+ SELECT b.id,
+    b.technical_type_code,
+    b.feedback,
+    b.description,
+        CASE
+            WHEN ((bv.target_code)::text = 'application'::text) THEN bv.target_application_moment
+            WHEN ((bv.target_code)::text = 'service'::text) THEN bv.target_service_moment
+            ELSE bv.target_reg_moment
+        END AS moment_code,
+    bd.body,
+    bv.severity_code,
+    bv.target_code,
+    bv.target_request_type_code,
+    bv.target_rrr_type_code,
+    bv.order_of_execution
+   FROM ((br b
+     LEFT JOIN br_validation bv ON (((b.id)::text = (bv.br_id)::text)))
+     JOIN br_definition bd ON (((b.id)::text = (bd.br_id)::text)))
+  WHERE ((now() >= bd.active_from) AND (now() <= bd.active_until))
+  ORDER BY b.id;
 
 
-ALTER TABLE system.br_report OWNER TO postgres;
+ALTER TABLE br_report OWNER TO postgres;
 
 --
 -- Name: VIEW br_report; Type: COMMENT; Schema: system; Owner: postgres
@@ -12920,7 +13232,7 @@ COMMENT ON VIEW br_report IS 'Used in the generation of the Admin Business Rules
 
 
 --
--- Name: br_severity_type; Type: TABLE; Schema: system; Owner: postgres; Tablespace: 
+-- Name: br_severity_type; Type: TABLE; Schema: system; Owner: postgres
 --
 
 CREATE TABLE br_severity_type (
@@ -12931,7 +13243,7 @@ CREATE TABLE br_severity_type (
 );
 
 
-ALTER TABLE system.br_severity_type OWNER TO postgres;
+ALTER TABLE br_severity_type OWNER TO postgres;
 
 --
 -- Name: TABLE br_severity_type; Type: COMMENT; Schema: system; Owner: postgres
@@ -12970,7 +13282,7 @@ COMMENT ON COLUMN br_severity_type.description IS 'A description of the severity
 
 
 --
--- Name: br_technical_type; Type: TABLE; Schema: system; Owner: postgres; Tablespace: 
+-- Name: br_technical_type; Type: TABLE; Schema: system; Owner: postgres
 --
 
 CREATE TABLE br_technical_type (
@@ -12981,7 +13293,7 @@ CREATE TABLE br_technical_type (
 );
 
 
-ALTER TABLE system.br_technical_type OWNER TO postgres;
+ALTER TABLE br_technical_type OWNER TO postgres;
 
 --
 -- Name: TABLE br_technical_type; Type: COMMENT; Schema: system; Owner: postgres
@@ -13020,7 +13332,7 @@ COMMENT ON COLUMN br_technical_type.description IS 'A description of the technic
 
 
 --
--- Name: br_validation_target_type; Type: TABLE; Schema: system; Owner: postgres; Tablespace: 
+-- Name: br_validation_target_type; Type: TABLE; Schema: system; Owner: postgres
 --
 
 CREATE TABLE br_validation_target_type (
@@ -13031,7 +13343,7 @@ CREATE TABLE br_validation_target_type (
 );
 
 
-ALTER TABLE system.br_validation_target_type OWNER TO postgres;
+ALTER TABLE br_validation_target_type OWNER TO postgres;
 
 --
 -- Name: TABLE br_validation_target_type; Type: COMMENT; Schema: system; Owner: postgres
@@ -13070,7 +13382,7 @@ COMMENT ON COLUMN br_validation_target_type.description IS 'A description of the
 
 
 --
--- Name: config_map_layer; Type: TABLE; Schema: system; Owner: postgres; Tablespace: 
+-- Name: config_map_layer; Type: TABLE; Schema: system; Owner: postgres
 --
 
 CREATE TABLE config_map_layer (
@@ -13095,11 +13407,17 @@ CREATE TABLE config_map_layer (
     added_from_bulk_operation boolean DEFAULT false NOT NULL,
     use_in_public_display boolean DEFAULT false NOT NULL,
     use_for_ot boolean DEFAULT false NOT NULL,
-    CONSTRAINT config_map_layer_fields_required CHECK (CASE WHEN ((type_code)::text = 'wms'::text) THEN ((url IS NOT NULL) AND (wms_layers IS NOT NULL)) WHEN ((type_code)::text = 'pojo'::text) THEN (((pojo_query_name IS NOT NULL) AND (pojo_structure IS NOT NULL)) AND (style IS NOT NULL)) WHEN ((type_code)::text = 'shape'::text) THEN ((shape_location IS NOT NULL) AND (style IS NOT NULL)) ELSE NULL::boolean END)
+    CONSTRAINT config_map_layer_fields_required CHECK (
+CASE
+    WHEN ((type_code)::text = 'wms'::text) THEN ((url IS NOT NULL) AND (wms_layers IS NOT NULL))
+    WHEN ((type_code)::text = 'pojo'::text) THEN ((pojo_query_name IS NOT NULL) AND (pojo_structure IS NOT NULL) AND (style IS NOT NULL))
+    WHEN ((type_code)::text = 'shape'::text) THEN ((shape_location IS NOT NULL) AND (style IS NOT NULL))
+    ELSE NULL::boolean
+END)
 );
 
 
-ALTER TABLE system.config_map_layer OWNER TO postgres;
+ALTER TABLE config_map_layer OWNER TO postgres;
 
 --
 -- Name: TABLE config_map_layer; Type: COMMENT; Schema: system; Owner: postgres
@@ -13257,7 +13575,7 @@ COMMENT ON COLUMN config_map_layer.use_for_ot IS 'Flag to indicate if the layer 
 
 
 --
--- Name: config_map_layer_metadata; Type: TABLE; Schema: system; Owner: postgres; Tablespace: 
+-- Name: config_map_layer_metadata; Type: TABLE; Schema: system; Owner: postgres
 --
 
 CREATE TABLE config_map_layer_metadata (
@@ -13267,10 +13585,10 @@ CREATE TABLE config_map_layer_metadata (
 );
 
 
-ALTER TABLE system.config_map_layer_metadata OWNER TO postgres;
+ALTER TABLE config_map_layer_metadata OWNER TO postgres;
 
 --
--- Name: config_map_layer_type; Type: TABLE; Schema: system; Owner: postgres; Tablespace: 
+-- Name: config_map_layer_type; Type: TABLE; Schema: system; Owner: postgres
 --
 
 CREATE TABLE config_map_layer_type (
@@ -13281,7 +13599,7 @@ CREATE TABLE config_map_layer_type (
 );
 
 
-ALTER TABLE system.config_map_layer_type OWNER TO postgres;
+ALTER TABLE config_map_layer_type OWNER TO postgres;
 
 --
 -- Name: TABLE config_map_layer_type; Type: COMMENT; Schema: system; Owner: postgres
@@ -13320,7 +13638,7 @@ COMMENT ON COLUMN config_map_layer_type.description IS 'A description of the map
 
 
 --
--- Name: config_panel_launcher; Type: TABLE; Schema: system; Owner: postgres; Tablespace: 
+-- Name: config_panel_launcher; Type: TABLE; Schema: system; Owner: postgres
 --
 
 CREATE TABLE config_panel_launcher (
@@ -13335,7 +13653,7 @@ CREATE TABLE config_panel_launcher (
 );
 
 
-ALTER TABLE system.config_panel_launcher OWNER TO postgres;
+ALTER TABLE config_panel_launcher OWNER TO postgres;
 
 --
 -- Name: TABLE config_panel_launcher; Type: COMMENT; Schema: system; Owner: postgres
@@ -13402,7 +13720,7 @@ COMMENT ON COLUMN config_panel_launcher.card_name IS 'The MainContentPanel card 
 
 
 --
--- Name: consolidation_config; Type: TABLE; Schema: system; Owner: postgres; Tablespace: 
+-- Name: consolidation_config; Type: TABLE; Schema: system; Owner: postgres
 --
 
 CREATE TABLE consolidation_config (
@@ -13417,7 +13735,7 @@ CREATE TABLE consolidation_config (
 );
 
 
-ALTER TABLE system.consolidation_config OWNER TO postgres;
+ALTER TABLE consolidation_config OWNER TO postgres;
 
 --
 -- Name: TABLE consolidation_config; Type: COMMENT; Schema: system; Owner: postgres
@@ -13476,7 +13794,7 @@ COMMENT ON COLUMN consolidation_config.log_in_extracted_rows IS 'True - If the r
 
 
 --
--- Name: crs; Type: TABLE; Schema: system; Owner: postgres; Tablespace: 
+-- Name: crs; Type: TABLE; Schema: system; Owner: postgres
 --
 
 CREATE TABLE crs (
@@ -13487,7 +13805,7 @@ CREATE TABLE crs (
 );
 
 
-ALTER TABLE system.crs OWNER TO postgres;
+ALTER TABLE crs OWNER TO postgres;
 
 --
 -- Name: TABLE crs; Type: COMMENT; Schema: system; Owner: postgres
@@ -13526,7 +13844,7 @@ COMMENT ON COLUMN crs.item_order IS 'Identifies the order the CRS is displayed i
 
 
 --
--- Name: email; Type: TABLE; Schema: system; Owner: postgres; Tablespace: 
+-- Name: email; Type: TABLE; Schema: system; Owner: postgres
 --
 
 CREATE TABLE email (
@@ -13546,7 +13864,7 @@ CREATE TABLE email (
 );
 
 
-ALTER TABLE system.email OWNER TO postgres;
+ALTER TABLE email OWNER TO postgres;
 
 --
 -- Name: TABLE email; Type: COMMENT; Schema: system; Owner: postgres
@@ -13647,7 +13965,7 @@ COMMENT ON COLUMN email.error IS 'Error message received when sending the messag
 
 
 --
--- Name: extracted_rows; Type: TABLE; Schema: system; Owner: postgres; Tablespace: 
+-- Name: extracted_rows; Type: TABLE; Schema: system; Owner: postgres
 --
 
 CREATE TABLE extracted_rows (
@@ -13656,7 +13974,7 @@ CREATE TABLE extracted_rows (
 );
 
 
-ALTER TABLE system.extracted_rows OWNER TO postgres;
+ALTER TABLE extracted_rows OWNER TO postgres;
 
 --
 -- Name: TABLE extracted_rows; Type: COMMENT; Schema: system; Owner: postgres
@@ -13680,7 +13998,7 @@ COMMENT ON COLUMN extracted_rows.rowidentifier IS 'The rowidentifier of the reco
 
 
 --
--- Name: language; Type: TABLE; Schema: system; Owner: postgres; Tablespace: 
+-- Name: language; Type: TABLE; Schema: system; Owner: postgres
 --
 
 CREATE TABLE language (
@@ -13693,7 +14011,7 @@ CREATE TABLE language (
 );
 
 
-ALTER TABLE system.language OWNER TO postgres;
+ALTER TABLE language OWNER TO postgres;
 
 --
 -- Name: TABLE language; Type: COMMENT; Schema: system; Owner: postgres
@@ -13746,7 +14064,7 @@ COMMENT ON COLUMN language.ltr IS 'Indicates text direction. If true, then left 
 
 
 --
--- Name: map_search_option; Type: TABLE; Schema: system; Owner: postgres; Tablespace: 
+-- Name: map_search_option; Type: TABLE; Schema: system; Owner: postgres
 --
 
 CREATE TABLE map_search_option (
@@ -13760,7 +14078,7 @@ CREATE TABLE map_search_option (
 );
 
 
-ALTER TABLE system.map_search_option OWNER TO postgres;
+ALTER TABLE map_search_option OWNER TO postgres;
 
 --
 -- Name: TABLE map_search_option; Type: COMMENT; Schema: system; Owner: postgres
@@ -13820,7 +14138,7 @@ COMMENT ON COLUMN map_search_option.description IS 'A description for the search
 
 
 --
--- Name: panel_launcher_group; Type: TABLE; Schema: system; Owner: postgres; Tablespace: 
+-- Name: panel_launcher_group; Type: TABLE; Schema: system; Owner: postgres
 --
 
 CREATE TABLE panel_launcher_group (
@@ -13831,7 +14149,7 @@ CREATE TABLE panel_launcher_group (
 );
 
 
-ALTER TABLE system.panel_launcher_group OWNER TO postgres;
+ALTER TABLE panel_launcher_group OWNER TO postgres;
 
 --
 -- Name: TABLE panel_launcher_group; Type: COMMENT; Schema: system; Owner: postgres
@@ -13881,7 +14199,7 @@ CREATE SEQUENCE process_consolidate
     CACHE 1;
 
 
-ALTER TABLE system.process_consolidate OWNER TO postgres;
+ALTER TABLE process_consolidate OWNER TO postgres;
 
 --
 -- Name: process_extract; Type: SEQUENCE; Schema: system; Owner: postgres
@@ -13895,10 +14213,10 @@ CREATE SEQUENCE process_extract
     CACHE 1;
 
 
-ALTER TABLE system.process_extract OWNER TO postgres;
+ALTER TABLE process_extract OWNER TO postgres;
 
 --
--- Name: query; Type: TABLE; Schema: system; Owner: postgres; Tablespace: 
+-- Name: query; Type: TABLE; Schema: system; Owner: postgres
 --
 
 CREATE TABLE query (
@@ -13908,7 +14226,7 @@ CREATE TABLE query (
 );
 
 
-ALTER TABLE system.query OWNER TO postgres;
+ALTER TABLE query OWNER TO postgres;
 
 --
 -- Name: TABLE query; Type: COMMENT; Schema: system; Owner: postgres
@@ -13940,7 +14258,7 @@ COMMENT ON COLUMN query.description IS 'Technical description for the query.';
 
 
 --
--- Name: query_field; Type: TABLE; Schema: system; Owner: postgres; Tablespace: 
+-- Name: query_field; Type: TABLE; Schema: system; Owner: postgres
 --
 
 CREATE TABLE query_field (
@@ -13951,7 +14269,7 @@ CREATE TABLE query_field (
 );
 
 
-ALTER TABLE system.query_field OWNER TO postgres;
+ALTER TABLE query_field OWNER TO postgres;
 
 --
 -- Name: TABLE query_field; Type: COMMENT; Schema: system; Owner: postgres
@@ -13990,7 +14308,7 @@ COMMENT ON COLUMN query_field.display_value IS 'The title to display for the que
 
 
 --
--- Name: version; Type: TABLE; Schema: system; Owner: postgres; Tablespace: 
+-- Name: version; Type: TABLE; Schema: system; Owner: postgres
 --
 
 CREATE TABLE version (
@@ -13998,7 +14316,7 @@ CREATE TABLE version (
 );
 
 
-ALTER TABLE system.version OWNER TO postgres;
+ALTER TABLE version OWNER TO postgres;
 
 --
 -- Name: TABLE version; Type: COMMENT; Schema: system; Owner: postgres
@@ -14018,7 +14336,7 @@ COMMENT ON COLUMN version.version_num IS 'The version number for the changeset.'
 SET search_path = transaction, pg_catalog;
 
 --
--- Name: reg_status_type; Type: TABLE; Schema: transaction; Owner: postgres; Tablespace: 
+-- Name: reg_status_type; Type: TABLE; Schema: transaction; Owner: postgres
 --
 
 CREATE TABLE reg_status_type (
@@ -14029,7 +14347,7 @@ CREATE TABLE reg_status_type (
 );
 
 
-ALTER TABLE transaction.reg_status_type OWNER TO postgres;
+ALTER TABLE reg_status_type OWNER TO postgres;
 
 --
 -- Name: TABLE reg_status_type; Type: COMMENT; Schema: transaction; Owner: postgres
@@ -14068,7 +14386,7 @@ COMMENT ON COLUMN reg_status_type.status IS 'Status of the registration status t
 
 
 --
--- Name: transaction_historic; Type: TABLE; Schema: transaction; Owner: postgres; Tablespace: 
+-- Name: transaction_historic; Type: TABLE; Schema: transaction; Owner: postgres
 --
 
 CREATE TABLE transaction_historic (
@@ -14087,10 +14405,10 @@ CREATE TABLE transaction_historic (
 );
 
 
-ALTER TABLE transaction.transaction_historic OWNER TO postgres;
+ALTER TABLE transaction_historic OWNER TO postgres;
 
 --
--- Name: transaction_source; Type: TABLE; Schema: transaction; Owner: postgres; Tablespace: 
+-- Name: transaction_source; Type: TABLE; Schema: transaction; Owner: postgres
 --
 
 CREATE TABLE transaction_source (
@@ -14104,7 +14422,7 @@ CREATE TABLE transaction_source (
 );
 
 
-ALTER TABLE transaction.transaction_source OWNER TO postgres;
+ALTER TABLE transaction_source OWNER TO postgres;
 
 --
 -- Name: TABLE transaction_source; Type: COMMENT; Schema: transaction; Owner: postgres
@@ -14164,7 +14482,7 @@ COMMENT ON COLUMN transaction_source.change_time IS 'The date and time the row w
 
 
 --
--- Name: transaction_source_historic; Type: TABLE; Schema: transaction; Owner: postgres; Tablespace: 
+-- Name: transaction_source_historic; Type: TABLE; Schema: transaction; Owner: postgres
 --
 
 CREATE TABLE transaction_source_historic (
@@ -14179,10 +14497,10 @@ CREATE TABLE transaction_source_historic (
 );
 
 
-ALTER TABLE transaction.transaction_source_historic OWNER TO postgres;
+ALTER TABLE transaction_source_historic OWNER TO postgres;
 
 --
--- Name: transaction_status_type; Type: TABLE; Schema: transaction; Owner: postgres; Tablespace: 
+-- Name: transaction_status_type; Type: TABLE; Schema: transaction; Owner: postgres
 --
 
 CREATE TABLE transaction_status_type (
@@ -14193,7 +14511,7 @@ CREATE TABLE transaction_status_type (
 );
 
 
-ALTER TABLE transaction.transaction_status_type OWNER TO postgres;
+ALTER TABLE transaction_status_type OWNER TO postgres;
 
 --
 -- Name: TABLE transaction_status_type; Type: COMMENT; Schema: transaction; Owner: postgres
@@ -14234,7 +14552,7 @@ COMMENT ON COLUMN transaction_status_type.status IS 'Status of the transaction s
 SET search_path = address, pg_catalog;
 
 --
--- Name: address_pkey; Type: CONSTRAINT; Schema: address; Owner: postgres; Tablespace: 
+-- Name: address_pkey; Type: CONSTRAINT; Schema: address; Owner: postgres
 --
 
 ALTER TABLE ONLY address
@@ -14244,7 +14562,7 @@ ALTER TABLE ONLY address
 SET search_path = administrative, pg_catalog;
 
 --
--- Name: ba_unit_area_pkey; Type: CONSTRAINT; Schema: administrative; Owner: postgres; Tablespace: 
+-- Name: ba_unit_area_pkey; Type: CONSTRAINT; Schema: administrative; Owner: postgres
 --
 
 ALTER TABLE ONLY ba_unit_area
@@ -14252,7 +14570,7 @@ ALTER TABLE ONLY ba_unit_area
 
 
 --
--- Name: ba_unit_as_party_pkey; Type: CONSTRAINT; Schema: administrative; Owner: postgres; Tablespace: 
+-- Name: ba_unit_as_party_pkey; Type: CONSTRAINT; Schema: administrative; Owner: postgres
 --
 
 ALTER TABLE ONLY ba_unit_as_party
@@ -14260,7 +14578,7 @@ ALTER TABLE ONLY ba_unit_as_party
 
 
 --
--- Name: ba_unit_contains_spatial_unit_pkey; Type: CONSTRAINT; Schema: administrative; Owner: postgres; Tablespace: 
+-- Name: ba_unit_contains_spatial_unit_pkey; Type: CONSTRAINT; Schema: administrative; Owner: postgres
 --
 
 ALTER TABLE ONLY ba_unit_contains_spatial_unit
@@ -14268,7 +14586,7 @@ ALTER TABLE ONLY ba_unit_contains_spatial_unit
 
 
 --
--- Name: ba_unit_pkey; Type: CONSTRAINT; Schema: administrative; Owner: postgres; Tablespace: 
+-- Name: ba_unit_pkey; Type: CONSTRAINT; Schema: administrative; Owner: postgres
 --
 
 ALTER TABLE ONLY ba_unit
@@ -14276,7 +14594,7 @@ ALTER TABLE ONLY ba_unit
 
 
 --
--- Name: ba_unit_rel_type_display_value_unique; Type: CONSTRAINT; Schema: administrative; Owner: postgres; Tablespace: 
+-- Name: ba_unit_rel_type_display_value_unique; Type: CONSTRAINT; Schema: administrative; Owner: postgres
 --
 
 ALTER TABLE ONLY ba_unit_rel_type
@@ -14284,7 +14602,7 @@ ALTER TABLE ONLY ba_unit_rel_type
 
 
 --
--- Name: ba_unit_rel_type_pkey; Type: CONSTRAINT; Schema: administrative; Owner: postgres; Tablespace: 
+-- Name: ba_unit_rel_type_pkey; Type: CONSTRAINT; Schema: administrative; Owner: postgres
 --
 
 ALTER TABLE ONLY ba_unit_rel_type
@@ -14292,7 +14610,7 @@ ALTER TABLE ONLY ba_unit_rel_type
 
 
 --
--- Name: ba_unit_target_pkey; Type: CONSTRAINT; Schema: administrative; Owner: postgres; Tablespace: 
+-- Name: ba_unit_target_pkey; Type: CONSTRAINT; Schema: administrative; Owner: postgres
 --
 
 ALTER TABLE ONLY ba_unit_target
@@ -14300,7 +14618,7 @@ ALTER TABLE ONLY ba_unit_target
 
 
 --
--- Name: ba_unit_type_display_value_unique; Type: CONSTRAINT; Schema: administrative; Owner: postgres; Tablespace: 
+-- Name: ba_unit_type_display_value_unique; Type: CONSTRAINT; Schema: administrative; Owner: postgres
 --
 
 ALTER TABLE ONLY ba_unit_type
@@ -14308,7 +14626,7 @@ ALTER TABLE ONLY ba_unit_type
 
 
 --
--- Name: ba_unit_type_pkey; Type: CONSTRAINT; Schema: administrative; Owner: postgres; Tablespace: 
+-- Name: ba_unit_type_pkey; Type: CONSTRAINT; Schema: administrative; Owner: postgres
 --
 
 ALTER TABLE ONLY ba_unit_type
@@ -14316,7 +14634,7 @@ ALTER TABLE ONLY ba_unit_type
 
 
 --
--- Name: condition_for_rrr_pkey; Type: CONSTRAINT; Schema: administrative; Owner: postgres; Tablespace: 
+-- Name: condition_for_rrr_pkey; Type: CONSTRAINT; Schema: administrative; Owner: postgres
 --
 
 ALTER TABLE ONLY condition_for_rrr
@@ -14324,7 +14642,7 @@ ALTER TABLE ONLY condition_for_rrr
 
 
 --
--- Name: condition_type_display_value_unique; Type: CONSTRAINT; Schema: administrative; Owner: postgres; Tablespace: 
+-- Name: condition_type_display_value_unique; Type: CONSTRAINT; Schema: administrative; Owner: postgres
 --
 
 ALTER TABLE ONLY condition_type
@@ -14332,7 +14650,7 @@ ALTER TABLE ONLY condition_type
 
 
 --
--- Name: condition_type_pkey; Type: CONSTRAINT; Schema: administrative; Owner: postgres; Tablespace: 
+-- Name: condition_type_pkey; Type: CONSTRAINT; Schema: administrative; Owner: postgres
 --
 
 ALTER TABLE ONLY condition_type
@@ -14340,7 +14658,7 @@ ALTER TABLE ONLY condition_type
 
 
 --
--- Name: mortgage_isbased_in_rrr_pkey; Type: CONSTRAINT; Schema: administrative; Owner: postgres; Tablespace: 
+-- Name: mortgage_isbased_in_rrr_pkey; Type: CONSTRAINT; Schema: administrative; Owner: postgres
 --
 
 ALTER TABLE ONLY mortgage_isbased_in_rrr
@@ -14348,7 +14666,7 @@ ALTER TABLE ONLY mortgage_isbased_in_rrr
 
 
 --
--- Name: mortgage_type_display_value_unique; Type: CONSTRAINT; Schema: administrative; Owner: postgres; Tablespace: 
+-- Name: mortgage_type_display_value_unique; Type: CONSTRAINT; Schema: administrative; Owner: postgres
 --
 
 ALTER TABLE ONLY mortgage_type
@@ -14356,7 +14674,7 @@ ALTER TABLE ONLY mortgage_type
 
 
 --
--- Name: mortgage_type_pkey; Type: CONSTRAINT; Schema: administrative; Owner: postgres; Tablespace: 
+-- Name: mortgage_type_pkey; Type: CONSTRAINT; Schema: administrative; Owner: postgres
 --
 
 ALTER TABLE ONLY mortgage_type
@@ -14364,16 +14682,15 @@ ALTER TABLE ONLY mortgage_type
 
 
 --
--- Name: notation_pkey; Type: CONSTRAINT; Schema: administrative; Owner: postgres; Tablespace: 
+-- Name: notation_pkey; Type: CONSTRAINT; Schema: administrative; Owner: postgres
 --
 
 ALTER TABLE ONLY notation
     ADD CONSTRAINT notation_pkey PRIMARY KEY (id);
 
 
-
 --
--- Name: party_for_rrr_pkey; Type: CONSTRAINT; Schema: administrative; Owner: postgres; Tablespace: 
+-- Name: party_for_rrr_pkey; Type: CONSTRAINT; Schema: administrative; Owner: postgres
 --
 
 ALTER TABLE ONLY party_for_rrr
@@ -14381,7 +14698,7 @@ ALTER TABLE ONLY party_for_rrr
 
 
 --
--- Name: required_relationship_baunit_pkey; Type: CONSTRAINT; Schema: administrative; Owner: postgres; Tablespace: 
+-- Name: required_relationship_baunit_pkey; Type: CONSTRAINT; Schema: administrative; Owner: postgres
 --
 
 ALTER TABLE ONLY required_relationship_baunit
@@ -14389,7 +14706,7 @@ ALTER TABLE ONLY required_relationship_baunit
 
 
 --
--- Name: rrr_group_type_display_value_unique; Type: CONSTRAINT; Schema: administrative; Owner: postgres; Tablespace: 
+-- Name: rrr_group_type_display_value_unique; Type: CONSTRAINT; Schema: administrative; Owner: postgres
 --
 
 ALTER TABLE ONLY rrr_group_type
@@ -14397,7 +14714,7 @@ ALTER TABLE ONLY rrr_group_type
 
 
 --
--- Name: rrr_group_type_pkey; Type: CONSTRAINT; Schema: administrative; Owner: postgres; Tablespace: 
+-- Name: rrr_group_type_pkey; Type: CONSTRAINT; Schema: administrative; Owner: postgres
 --
 
 ALTER TABLE ONLY rrr_group_type
@@ -14405,7 +14722,7 @@ ALTER TABLE ONLY rrr_group_type
 
 
 --
--- Name: rrr_pkey; Type: CONSTRAINT; Schema: administrative; Owner: postgres; Tablespace: 
+-- Name: rrr_pkey; Type: CONSTRAINT; Schema: administrative; Owner: postgres
 --
 
 ALTER TABLE ONLY rrr
@@ -14413,7 +14730,7 @@ ALTER TABLE ONLY rrr
 
 
 --
--- Name: rrr_share_pkey; Type: CONSTRAINT; Schema: administrative; Owner: postgres; Tablespace: 
+-- Name: rrr_share_pkey; Type: CONSTRAINT; Schema: administrative; Owner: postgres
 --
 
 ALTER TABLE ONLY rrr_share
@@ -14421,7 +14738,7 @@ ALTER TABLE ONLY rrr_share
 
 
 --
--- Name: rrr_type_display_value_unique; Type: CONSTRAINT; Schema: administrative; Owner: postgres; Tablespace: 
+-- Name: rrr_type_display_value_unique; Type: CONSTRAINT; Schema: administrative; Owner: postgres
 --
 
 ALTER TABLE ONLY rrr_type
@@ -14429,7 +14746,7 @@ ALTER TABLE ONLY rrr_type
 
 
 --
--- Name: rrr_type_pkey; Type: CONSTRAINT; Schema: administrative; Owner: postgres; Tablespace: 
+-- Name: rrr_type_pkey; Type: CONSTRAINT; Schema: administrative; Owner: postgres
 --
 
 ALTER TABLE ONLY rrr_type
@@ -14437,7 +14754,7 @@ ALTER TABLE ONLY rrr_type
 
 
 --
--- Name: source_describes_ba_unit_pkey; Type: CONSTRAINT; Schema: administrative; Owner: postgres; Tablespace: 
+-- Name: source_describes_ba_unit_pkey; Type: CONSTRAINT; Schema: administrative; Owner: postgres
 --
 
 ALTER TABLE ONLY source_describes_ba_unit
@@ -14445,7 +14762,7 @@ ALTER TABLE ONLY source_describes_ba_unit
 
 
 --
--- Name: source_describes_rrr_pkey; Type: CONSTRAINT; Schema: administrative; Owner: postgres; Tablespace: 
+-- Name: source_describes_rrr_pkey; Type: CONSTRAINT; Schema: administrative; Owner: postgres
 --
 
 ALTER TABLE ONLY source_describes_rrr
@@ -14455,7 +14772,7 @@ ALTER TABLE ONLY source_describes_rrr
 SET search_path = application, pg_catalog;
 
 --
--- Name: application_action_type_display_value_unique; Type: CONSTRAINT; Schema: application; Owner: postgres; Tablespace: 
+-- Name: application_action_type_display_value_unique; Type: CONSTRAINT; Schema: application; Owner: postgres
 --
 
 ALTER TABLE ONLY application_action_type
@@ -14463,7 +14780,7 @@ ALTER TABLE ONLY application_action_type
 
 
 --
--- Name: application_action_type_pkey; Type: CONSTRAINT; Schema: application; Owner: postgres; Tablespace: 
+-- Name: application_action_type_pkey; Type: CONSTRAINT; Schema: application; Owner: postgres
 --
 
 ALTER TABLE ONLY application_action_type
@@ -14471,7 +14788,7 @@ ALTER TABLE ONLY application_action_type
 
 
 --
--- Name: application_pkey; Type: CONSTRAINT; Schema: application; Owner: postgres; Tablespace: 
+-- Name: application_pkey; Type: CONSTRAINT; Schema: application; Owner: postgres
 --
 
 ALTER TABLE ONLY application
@@ -14479,7 +14796,7 @@ ALTER TABLE ONLY application
 
 
 --
--- Name: application_property_pkey; Type: CONSTRAINT; Schema: application; Owner: postgres; Tablespace: 
+-- Name: application_property_pkey; Type: CONSTRAINT; Schema: application; Owner: postgres
 --
 
 ALTER TABLE ONLY application_property
@@ -14487,7 +14804,7 @@ ALTER TABLE ONLY application_property
 
 
 --
--- Name: application_property_property_once; Type: CONSTRAINT; Schema: application; Owner: postgres; Tablespace: 
+-- Name: application_property_property_once; Type: CONSTRAINT; Schema: application; Owner: postgres
 --
 
 ALTER TABLE ONLY application_property
@@ -14495,7 +14812,7 @@ ALTER TABLE ONLY application_property
 
 
 --
--- Name: application_spatial_unit_pkey; Type: CONSTRAINT; Schema: application; Owner: postgres; Tablespace: 
+-- Name: application_spatial_unit_pkey; Type: CONSTRAINT; Schema: application; Owner: postgres
 --
 
 ALTER TABLE ONLY application_spatial_unit
@@ -14503,7 +14820,7 @@ ALTER TABLE ONLY application_spatial_unit
 
 
 --
--- Name: application_status_type_display_value_unique; Type: CONSTRAINT; Schema: application; Owner: postgres; Tablespace: 
+-- Name: application_status_type_display_value_unique; Type: CONSTRAINT; Schema: application; Owner: postgres
 --
 
 ALTER TABLE ONLY application_status_type
@@ -14511,7 +14828,7 @@ ALTER TABLE ONLY application_status_type
 
 
 --
--- Name: application_status_type_pkey; Type: CONSTRAINT; Schema: application; Owner: postgres; Tablespace: 
+-- Name: application_status_type_pkey; Type: CONSTRAINT; Schema: application; Owner: postgres
 --
 
 ALTER TABLE ONLY application_status_type
@@ -14519,7 +14836,7 @@ ALTER TABLE ONLY application_status_type
 
 
 --
--- Name: application_uses_source_pkey; Type: CONSTRAINT; Schema: application; Owner: postgres; Tablespace: 
+-- Name: application_uses_source_pkey; Type: CONSTRAINT; Schema: application; Owner: postgres
 --
 
 ALTER TABLE ONLY application_uses_source
@@ -14527,7 +14844,47 @@ ALTER TABLE ONLY application_uses_source
 
 
 --
--- Name: request_category_type_display_value_unique; Type: CONSTRAINT; Schema: application; Owner: postgres; Tablespace: 
+-- Name: notifiy_property_pkey; Type: CONSTRAINT; Schema: application; Owner: postgres
+--
+
+ALTER TABLE ONLY notify_property
+    ADD CONSTRAINT notifiy_property_pkey PRIMARY KEY (notify_id, ba_unit_id);
+
+
+--
+-- Name: notify_pkey; Type: CONSTRAINT; Schema: application; Owner: postgres
+--
+
+ALTER TABLE ONLY notify
+    ADD CONSTRAINT notify_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: notify_relationship_type_display_value_unique; Type: CONSTRAINT; Schema: application; Owner: postgres
+--
+
+ALTER TABLE ONLY notify_relationship_type
+    ADD CONSTRAINT notify_relationship_type_display_value_unique UNIQUE (display_value);
+
+
+--
+-- Name: notify_relationship_type_pkey; Type: CONSTRAINT; Schema: application; Owner: postgres
+--
+
+ALTER TABLE ONLY notify_relationship_type
+    ADD CONSTRAINT notify_relationship_type_pkey PRIMARY KEY (code);
+
+
+--
+-- Name: notify_uses_source_pkey; Type: CONSTRAINT; Schema: application; Owner: postgres
+--
+
+ALTER TABLE ONLY notify_uses_source
+    ADD CONSTRAINT notify_uses_source_pkey PRIMARY KEY (notify_id, source_id);
+
+
+--
+-- Name: request_category_type_display_value_unique; Type: CONSTRAINT; Schema: application; Owner: postgres
 --
 
 ALTER TABLE ONLY request_category_type
@@ -14535,7 +14892,7 @@ ALTER TABLE ONLY request_category_type
 
 
 --
--- Name: request_category_type_pkey; Type: CONSTRAINT; Schema: application; Owner: postgres; Tablespace: 
+-- Name: request_category_type_pkey; Type: CONSTRAINT; Schema: application; Owner: postgres
 --
 
 ALTER TABLE ONLY request_category_type
@@ -14543,7 +14900,7 @@ ALTER TABLE ONLY request_category_type
 
 
 --
--- Name: request_display_group_display_value_unique; Type: CONSTRAINT; Schema: application; Owner: postgres; Tablespace: 
+-- Name: request_display_group_display_value_unique; Type: CONSTRAINT; Schema: application; Owner: postgres
 --
 
 ALTER TABLE ONLY request_display_group
@@ -14551,7 +14908,7 @@ ALTER TABLE ONLY request_display_group
 
 
 --
--- Name: request_display_group_pkey; Type: CONSTRAINT; Schema: application; Owner: postgres; Tablespace: 
+-- Name: request_display_group_pkey; Type: CONSTRAINT; Schema: application; Owner: postgres
 --
 
 ALTER TABLE ONLY request_display_group
@@ -14559,7 +14916,7 @@ ALTER TABLE ONLY request_display_group
 
 
 --
--- Name: request_type_display_value_unique; Type: CONSTRAINT; Schema: application; Owner: postgres; Tablespace: 
+-- Name: request_type_display_value_unique; Type: CONSTRAINT; Schema: application; Owner: postgres
 --
 
 ALTER TABLE ONLY request_type
@@ -14567,7 +14924,7 @@ ALTER TABLE ONLY request_type
 
 
 --
--- Name: request_type_pkey; Type: CONSTRAINT; Schema: application; Owner: postgres; Tablespace: 
+-- Name: request_type_pkey; Type: CONSTRAINT; Schema: application; Owner: postgres
 --
 
 ALTER TABLE ONLY request_type
@@ -14575,7 +14932,7 @@ ALTER TABLE ONLY request_type
 
 
 --
--- Name: request_type_requires_source_type_pkey; Type: CONSTRAINT; Schema: application; Owner: postgres; Tablespace: 
+-- Name: request_type_requires_source_type_pkey; Type: CONSTRAINT; Schema: application; Owner: postgres
 --
 
 ALTER TABLE ONLY request_type_requires_source_type
@@ -14583,7 +14940,7 @@ ALTER TABLE ONLY request_type_requires_source_type
 
 
 --
--- Name: service_action_type_display_value_unique; Type: CONSTRAINT; Schema: application; Owner: postgres; Tablespace: 
+-- Name: service_action_type_display_value_unique; Type: CONSTRAINT; Schema: application; Owner: postgres
 --
 
 ALTER TABLE ONLY service_action_type
@@ -14591,7 +14948,7 @@ ALTER TABLE ONLY service_action_type
 
 
 --
--- Name: service_action_type_pkey; Type: CONSTRAINT; Schema: application; Owner: postgres; Tablespace: 
+-- Name: service_action_type_pkey; Type: CONSTRAINT; Schema: application; Owner: postgres
 --
 
 ALTER TABLE ONLY service_action_type
@@ -14599,7 +14956,7 @@ ALTER TABLE ONLY service_action_type
 
 
 --
--- Name: service_pkey; Type: CONSTRAINT; Schema: application; Owner: postgres; Tablespace: 
+-- Name: service_pkey; Type: CONSTRAINT; Schema: application; Owner: postgres
 --
 
 ALTER TABLE ONLY service
@@ -14607,7 +14964,7 @@ ALTER TABLE ONLY service
 
 
 --
--- Name: service_status_type_display_value_unique; Type: CONSTRAINT; Schema: application; Owner: postgres; Tablespace: 
+-- Name: service_status_type_display_value_unique; Type: CONSTRAINT; Schema: application; Owner: postgres
 --
 
 ALTER TABLE ONLY service_status_type
@@ -14615,7 +14972,7 @@ ALTER TABLE ONLY service_status_type
 
 
 --
--- Name: service_status_type_pkey; Type: CONSTRAINT; Schema: application; Owner: postgres; Tablespace: 
+-- Name: service_status_type_pkey; Type: CONSTRAINT; Schema: application; Owner: postgres
 --
 
 ALTER TABLE ONLY service_status_type
@@ -14623,7 +14980,7 @@ ALTER TABLE ONLY service_status_type
 
 
 --
--- Name: type_action_display_value_unique; Type: CONSTRAINT; Schema: application; Owner: postgres; Tablespace: 
+-- Name: type_action_display_value_unique; Type: CONSTRAINT; Schema: application; Owner: postgres
 --
 
 ALTER TABLE ONLY type_action
@@ -14631,30 +14988,17 @@ ALTER TABLE ONLY type_action
 
 
 --
--- Name: type_action_pkey; Type: CONSTRAINT; Schema: application; Owner: postgres; Tablespace: 
+-- Name: type_action_pkey; Type: CONSTRAINT; Schema: application; Owner: postgres
 --
 
 ALTER TABLE ONLY type_action
     ADD CONSTRAINT type_action_pkey PRIMARY KEY (code);
 
 
-
-SET search_path = bulk_operation, pg_catalog;
-
---
--- Name: spatial_unit_temporary_pkey; Type: CONSTRAINT; Schema: bulk_operation; Owner: postgres; Tablespace: 
---
-
-ALTER TABLE ONLY spatial_unit_temporary
-    ADD CONSTRAINT spatial_unit_temporary_pkey PRIMARY KEY (id);
-
-
-
-
 SET search_path = cadastre, pg_catalog;
 
 --
--- Name: area_type_display_value_unique; Type: CONSTRAINT; Schema: cadastre; Owner: postgres; Tablespace: 
+-- Name: area_type_display_value_unique; Type: CONSTRAINT; Schema: cadastre; Owner: postgres
 --
 
 ALTER TABLE ONLY area_type
@@ -14662,7 +15006,7 @@ ALTER TABLE ONLY area_type
 
 
 --
--- Name: area_type_pkey; Type: CONSTRAINT; Schema: cadastre; Owner: postgres; Tablespace: 
+-- Name: area_type_pkey; Type: CONSTRAINT; Schema: cadastre; Owner: postgres
 --
 
 ALTER TABLE ONLY area_type
@@ -14670,7 +15014,7 @@ ALTER TABLE ONLY area_type
 
 
 --
--- Name: building_unit_type_display_value_unique; Type: CONSTRAINT; Schema: cadastre; Owner: postgres; Tablespace: 
+-- Name: building_unit_type_display_value_unique; Type: CONSTRAINT; Schema: cadastre; Owner: postgres
 --
 
 ALTER TABLE ONLY building_unit_type
@@ -14678,7 +15022,7 @@ ALTER TABLE ONLY building_unit_type
 
 
 --
--- Name: building_unit_type_pkey; Type: CONSTRAINT; Schema: cadastre; Owner: postgres; Tablespace: 
+-- Name: building_unit_type_pkey; Type: CONSTRAINT; Schema: cadastre; Owner: postgres
 --
 
 ALTER TABLE ONLY building_unit_type
@@ -14686,7 +15030,7 @@ ALTER TABLE ONLY building_unit_type
 
 
 --
--- Name: cadastre_object_name; Type: CONSTRAINT; Schema: cadastre; Owner: postgres; Tablespace: 
+-- Name: cadastre_object_name; Type: CONSTRAINT; Schema: cadastre; Owner: postgres
 --
 
 ALTER TABLE ONLY cadastre_object
@@ -14694,7 +15038,7 @@ ALTER TABLE ONLY cadastre_object
 
 
 --
--- Name: cadastre_object_node_target_pkey; Type: CONSTRAINT; Schema: cadastre; Owner: postgres; Tablespace: 
+-- Name: cadastre_object_node_target_pkey; Type: CONSTRAINT; Schema: cadastre; Owner: postgres
 --
 
 ALTER TABLE ONLY cadastre_object_node_target
@@ -14702,7 +15046,7 @@ ALTER TABLE ONLY cadastre_object_node_target
 
 
 --
--- Name: cadastre_object_pkey; Type: CONSTRAINT; Schema: cadastre; Owner: postgres; Tablespace: 
+-- Name: cadastre_object_pkey; Type: CONSTRAINT; Schema: cadastre; Owner: postgres
 --
 
 ALTER TABLE ONLY cadastre_object
@@ -14710,7 +15054,7 @@ ALTER TABLE ONLY cadastre_object
 
 
 --
--- Name: cadastre_object_target_pkey; Type: CONSTRAINT; Schema: cadastre; Owner: postgres; Tablespace: 
+-- Name: cadastre_object_target_pkey; Type: CONSTRAINT; Schema: cadastre; Owner: postgres
 --
 
 ALTER TABLE ONLY cadastre_object_target
@@ -14718,7 +15062,7 @@ ALTER TABLE ONLY cadastre_object_target
 
 
 --
--- Name: cadastre_object_type_display_value_unique; Type: CONSTRAINT; Schema: cadastre; Owner: postgres; Tablespace: 
+-- Name: cadastre_object_type_display_value_unique; Type: CONSTRAINT; Schema: cadastre; Owner: postgres
 --
 
 ALTER TABLE ONLY cadastre_object_type
@@ -14726,7 +15070,7 @@ ALTER TABLE ONLY cadastre_object_type
 
 
 --
--- Name: cadastre_object_type_pkey; Type: CONSTRAINT; Schema: cadastre; Owner: postgres; Tablespace: 
+-- Name: cadastre_object_type_pkey; Type: CONSTRAINT; Schema: cadastre; Owner: postgres
 --
 
 ALTER TABLE ONLY cadastre_object_type
@@ -14734,7 +15078,7 @@ ALTER TABLE ONLY cadastre_object_type
 
 
 --
--- Name: config_map_layer_pkey; Type: CONSTRAINT; Schema: cadastre; Owner: postgres; Tablespace: 
+-- Name: config_map_layer_pkey; Type: CONSTRAINT; Schema: cadastre; Owner: postgres
 --
 
 ALTER TABLE ONLY level_config_map_layer
@@ -14742,7 +15086,7 @@ ALTER TABLE ONLY level_config_map_layer
 
 
 --
--- Name: dimension_type_display_value_unique; Type: CONSTRAINT; Schema: cadastre; Owner: postgres; Tablespace: 
+-- Name: dimension_type_display_value_unique; Type: CONSTRAINT; Schema: cadastre; Owner: postgres
 --
 
 ALTER TABLE ONLY dimension_type
@@ -14750,7 +15094,7 @@ ALTER TABLE ONLY dimension_type
 
 
 --
--- Name: dimension_type_pkey; Type: CONSTRAINT; Schema: cadastre; Owner: postgres; Tablespace: 
+-- Name: dimension_type_pkey; Type: CONSTRAINT; Schema: cadastre; Owner: postgres
 --
 
 ALTER TABLE ONLY dimension_type
@@ -14758,7 +15102,7 @@ ALTER TABLE ONLY dimension_type
 
 
 --
--- Name: hierarchy_level_display_value_unique; Type: CONSTRAINT; Schema: cadastre; Owner: postgres; Tablespace: 
+-- Name: hierarchy_level_display_value_unique; Type: CONSTRAINT; Schema: cadastre; Owner: postgres
 --
 
 ALTER TABLE ONLY hierarchy_level
@@ -14766,7 +15110,7 @@ ALTER TABLE ONLY hierarchy_level
 
 
 --
--- Name: hierarchy_level_pkey; Type: CONSTRAINT; Schema: cadastre; Owner: postgres; Tablespace: 
+-- Name: hierarchy_level_pkey; Type: CONSTRAINT; Schema: cadastre; Owner: postgres
 --
 
 ALTER TABLE ONLY hierarchy_level
@@ -14774,7 +15118,7 @@ ALTER TABLE ONLY hierarchy_level
 
 
 --
--- Name: land_use_type_display_value_unique; Type: CONSTRAINT; Schema: cadastre; Owner: postgres; Tablespace: 
+-- Name: land_use_type_display_value_unique; Type: CONSTRAINT; Schema: cadastre; Owner: postgres
 --
 
 ALTER TABLE ONLY land_use_type
@@ -14782,7 +15126,7 @@ ALTER TABLE ONLY land_use_type
 
 
 --
--- Name: land_use_type_pkey; Type: CONSTRAINT; Schema: cadastre; Owner: postgres; Tablespace: 
+-- Name: land_use_type_pkey; Type: CONSTRAINT; Schema: cadastre; Owner: postgres
 --
 
 ALTER TABLE ONLY land_use_type
@@ -14790,7 +15134,7 @@ ALTER TABLE ONLY land_use_type
 
 
 --
--- Name: legal_space_utility_network_pkey; Type: CONSTRAINT; Schema: cadastre; Owner: postgres; Tablespace: 
+-- Name: legal_space_utility_network_pkey; Type: CONSTRAINT; Schema: cadastre; Owner: postgres
 --
 
 ALTER TABLE ONLY legal_space_utility_network
@@ -14798,7 +15142,7 @@ ALTER TABLE ONLY legal_space_utility_network
 
 
 --
--- Name: level_content_type_display_value_unique; Type: CONSTRAINT; Schema: cadastre; Owner: postgres; Tablespace: 
+-- Name: level_content_type_display_value_unique; Type: CONSTRAINT; Schema: cadastre; Owner: postgres
 --
 
 ALTER TABLE ONLY level_content_type
@@ -14806,7 +15150,7 @@ ALTER TABLE ONLY level_content_type
 
 
 --
--- Name: level_content_type_pkey; Type: CONSTRAINT; Schema: cadastre; Owner: postgres; Tablespace: 
+-- Name: level_content_type_pkey; Type: CONSTRAINT; Schema: cadastre; Owner: postgres
 --
 
 ALTER TABLE ONLY level_content_type
@@ -14814,7 +15158,7 @@ ALTER TABLE ONLY level_content_type
 
 
 --
--- Name: level_pkey; Type: CONSTRAINT; Schema: cadastre; Owner: postgres; Tablespace: 
+-- Name: level_pkey; Type: CONSTRAINT; Schema: cadastre; Owner: postgres
 --
 
 ALTER TABLE ONLY level
@@ -14822,7 +15166,7 @@ ALTER TABLE ONLY level
 
 
 --
--- Name: register_type_display_value_unique; Type: CONSTRAINT; Schema: cadastre; Owner: postgres; Tablespace: 
+-- Name: register_type_display_value_unique; Type: CONSTRAINT; Schema: cadastre; Owner: postgres
 --
 
 ALTER TABLE ONLY register_type
@@ -14830,7 +15174,7 @@ ALTER TABLE ONLY register_type
 
 
 --
--- Name: register_type_pkey; Type: CONSTRAINT; Schema: cadastre; Owner: postgres; Tablespace: 
+-- Name: register_type_pkey; Type: CONSTRAINT; Schema: cadastre; Owner: postgres
 --
 
 ALTER TABLE ONLY register_type
@@ -14838,7 +15182,7 @@ ALTER TABLE ONLY register_type
 
 
 --
--- Name: spatial_unit_address_pkey; Type: CONSTRAINT; Schema: cadastre; Owner: postgres; Tablespace: 
+-- Name: spatial_unit_address_pkey; Type: CONSTRAINT; Schema: cadastre; Owner: postgres
 --
 
 ALTER TABLE ONLY spatial_unit_address
@@ -14846,7 +15190,7 @@ ALTER TABLE ONLY spatial_unit_address
 
 
 --
--- Name: spatial_unit_group_pkey; Type: CONSTRAINT; Schema: cadastre; Owner: postgres; Tablespace: 
+-- Name: spatial_unit_group_pkey; Type: CONSTRAINT; Schema: cadastre; Owner: postgres
 --
 
 ALTER TABLE ONLY spatial_unit_group
@@ -14854,7 +15198,7 @@ ALTER TABLE ONLY spatial_unit_group
 
 
 --
--- Name: spatial_unit_in_group_pkey; Type: CONSTRAINT; Schema: cadastre; Owner: postgres; Tablespace: 
+-- Name: spatial_unit_in_group_pkey; Type: CONSTRAINT; Schema: cadastre; Owner: postgres
 --
 
 ALTER TABLE ONLY spatial_unit_in_group
@@ -14862,7 +15206,7 @@ ALTER TABLE ONLY spatial_unit_in_group
 
 
 --
--- Name: spatial_unit_pkey; Type: CONSTRAINT; Schema: cadastre; Owner: postgres; Tablespace: 
+-- Name: spatial_unit_pkey; Type: CONSTRAINT; Schema: cadastre; Owner: postgres
 --
 
 ALTER TABLE ONLY spatial_unit
@@ -14870,7 +15214,7 @@ ALTER TABLE ONLY spatial_unit
 
 
 --
--- Name: spatial_value_area_pkey; Type: CONSTRAINT; Schema: cadastre; Owner: postgres; Tablespace: 
+-- Name: spatial_value_area_pkey; Type: CONSTRAINT; Schema: cadastre; Owner: postgres
 --
 
 ALTER TABLE ONLY spatial_value_area
@@ -14878,7 +15222,7 @@ ALTER TABLE ONLY spatial_value_area
 
 
 --
--- Name: structure_type_display_value_unique; Type: CONSTRAINT; Schema: cadastre; Owner: postgres; Tablespace: 
+-- Name: structure_type_display_value_unique; Type: CONSTRAINT; Schema: cadastre; Owner: postgres
 --
 
 ALTER TABLE ONLY structure_type
@@ -14886,7 +15230,7 @@ ALTER TABLE ONLY structure_type
 
 
 --
--- Name: structure_type_pkey; Type: CONSTRAINT; Schema: cadastre; Owner: postgres; Tablespace: 
+-- Name: structure_type_pkey; Type: CONSTRAINT; Schema: cadastre; Owner: postgres
 --
 
 ALTER TABLE ONLY structure_type
@@ -14894,7 +15238,7 @@ ALTER TABLE ONLY structure_type
 
 
 --
--- Name: surface_relation_type_display_value_unique; Type: CONSTRAINT; Schema: cadastre; Owner: postgres; Tablespace: 
+-- Name: surface_relation_type_display_value_unique; Type: CONSTRAINT; Schema: cadastre; Owner: postgres
 --
 
 ALTER TABLE ONLY surface_relation_type
@@ -14902,7 +15246,7 @@ ALTER TABLE ONLY surface_relation_type
 
 
 --
--- Name: surface_relation_type_pkey; Type: CONSTRAINT; Schema: cadastre; Owner: postgres; Tablespace: 
+-- Name: surface_relation_type_pkey; Type: CONSTRAINT; Schema: cadastre; Owner: postgres
 --
 
 ALTER TABLE ONLY surface_relation_type
@@ -14910,7 +15254,7 @@ ALTER TABLE ONLY surface_relation_type
 
 
 --
--- Name: survey_point_pkey; Type: CONSTRAINT; Schema: cadastre; Owner: postgres; Tablespace: 
+-- Name: survey_point_pkey; Type: CONSTRAINT; Schema: cadastre; Owner: postgres
 --
 
 ALTER TABLE ONLY survey_point
@@ -14918,7 +15262,7 @@ ALTER TABLE ONLY survey_point
 
 
 --
--- Name: utility_network_status_type_display_value_unique; Type: CONSTRAINT; Schema: cadastre; Owner: postgres; Tablespace: 
+-- Name: utility_network_status_type_display_value_unique; Type: CONSTRAINT; Schema: cadastre; Owner: postgres
 --
 
 ALTER TABLE ONLY utility_network_status_type
@@ -14926,7 +15270,7 @@ ALTER TABLE ONLY utility_network_status_type
 
 
 --
--- Name: utility_network_status_type_pkey; Type: CONSTRAINT; Schema: cadastre; Owner: postgres; Tablespace: 
+-- Name: utility_network_status_type_pkey; Type: CONSTRAINT; Schema: cadastre; Owner: postgres
 --
 
 ALTER TABLE ONLY utility_network_status_type
@@ -14934,7 +15278,7 @@ ALTER TABLE ONLY utility_network_status_type
 
 
 --
--- Name: utility_network_type_display_value_unique; Type: CONSTRAINT; Schema: cadastre; Owner: postgres; Tablespace: 
+-- Name: utility_network_type_display_value_unique; Type: CONSTRAINT; Schema: cadastre; Owner: postgres
 --
 
 ALTER TABLE ONLY utility_network_type
@@ -14942,7 +15286,7 @@ ALTER TABLE ONLY utility_network_type
 
 
 --
--- Name: utility_network_type_pkey; Type: CONSTRAINT; Schema: cadastre; Owner: postgres; Tablespace: 
+-- Name: utility_network_type_pkey; Type: CONSTRAINT; Schema: cadastre; Owner: postgres
 --
 
 ALTER TABLE ONLY utility_network_type
@@ -14952,7 +15296,7 @@ ALTER TABLE ONLY utility_network_type
 SET search_path = document, pg_catalog;
 
 --
--- Name: document_nr_unique; Type: CONSTRAINT; Schema: document; Owner: postgres; Tablespace: 
+-- Name: document_nr_unique; Type: CONSTRAINT; Schema: document; Owner: postgres
 --
 
 ALTER TABLE ONLY document
@@ -14960,7 +15304,7 @@ ALTER TABLE ONLY document
 
 
 --
--- Name: document_pkey; Type: CONSTRAINT; Schema: document; Owner: postgres; Tablespace: 
+-- Name: document_pkey; Type: CONSTRAINT; Schema: document; Owner: postgres
 --
 
 ALTER TABLE ONLY document
@@ -14968,7 +15312,7 @@ ALTER TABLE ONLY document
 
 
 --
--- Name: id_pkey_document_chunk; Type: CONSTRAINT; Schema: document; Owner: postgres; Tablespace: 
+-- Name: id_pkey_document_chunk; Type: CONSTRAINT; Schema: document; Owner: postgres
 --
 
 ALTER TABLE ONLY document_chunk
@@ -14976,7 +15320,7 @@ ALTER TABLE ONLY document_chunk
 
 
 --
--- Name: start_unique_document_chunk; Type: CONSTRAINT; Schema: document; Owner: postgres; Tablespace: 
+-- Name: start_unique_document_chunk; Type: CONSTRAINT; Schema: document; Owner: postgres
 --
 
 ALTER TABLE ONLY document_chunk
@@ -14986,7 +15330,7 @@ ALTER TABLE ONLY document_chunk
 SET search_path = party, pg_catalog;
 
 --
--- Name: communication_type_display_value_unique; Type: CONSTRAINT; Schema: party; Owner: postgres; Tablespace: 
+-- Name: communication_type_display_value_unique; Type: CONSTRAINT; Schema: party; Owner: postgres
 --
 
 ALTER TABLE ONLY communication_type
@@ -14994,7 +15338,7 @@ ALTER TABLE ONLY communication_type
 
 
 --
--- Name: communication_type_pkey; Type: CONSTRAINT; Schema: party; Owner: postgres; Tablespace: 
+-- Name: communication_type_pkey; Type: CONSTRAINT; Schema: party; Owner: postgres
 --
 
 ALTER TABLE ONLY communication_type
@@ -15002,7 +15346,7 @@ ALTER TABLE ONLY communication_type
 
 
 --
--- Name: gender_type_display_value_unique; Type: CONSTRAINT; Schema: party; Owner: postgres; Tablespace: 
+-- Name: gender_type_display_value_unique; Type: CONSTRAINT; Schema: party; Owner: postgres
 --
 
 ALTER TABLE ONLY gender_type
@@ -15010,7 +15354,7 @@ ALTER TABLE ONLY gender_type
 
 
 --
--- Name: gender_type_pkey; Type: CONSTRAINT; Schema: party; Owner: postgres; Tablespace: 
+-- Name: gender_type_pkey; Type: CONSTRAINT; Schema: party; Owner: postgres
 --
 
 ALTER TABLE ONLY gender_type
@@ -15018,7 +15362,7 @@ ALTER TABLE ONLY gender_type
 
 
 --
--- Name: group_party_pkey; Type: CONSTRAINT; Schema: party; Owner: postgres; Tablespace: 
+-- Name: group_party_pkey; Type: CONSTRAINT; Schema: party; Owner: postgres
 --
 
 ALTER TABLE ONLY group_party
@@ -15026,7 +15370,7 @@ ALTER TABLE ONLY group_party
 
 
 --
--- Name: group_party_type_display_value_unique; Type: CONSTRAINT; Schema: party; Owner: postgres; Tablespace: 
+-- Name: group_party_type_display_value_unique; Type: CONSTRAINT; Schema: party; Owner: postgres
 --
 
 ALTER TABLE ONLY group_party_type
@@ -15034,7 +15378,7 @@ ALTER TABLE ONLY group_party_type
 
 
 --
--- Name: group_party_type_pkey; Type: CONSTRAINT; Schema: party; Owner: postgres; Tablespace: 
+-- Name: group_party_type_pkey; Type: CONSTRAINT; Schema: party; Owner: postgres
 --
 
 ALTER TABLE ONLY group_party_type
@@ -15042,7 +15386,7 @@ ALTER TABLE ONLY group_party_type
 
 
 --
--- Name: id_type_display_value_unique; Type: CONSTRAINT; Schema: party; Owner: postgres; Tablespace: 
+-- Name: id_type_display_value_unique; Type: CONSTRAINT; Schema: party; Owner: postgres
 --
 
 ALTER TABLE ONLY id_type
@@ -15050,7 +15394,7 @@ ALTER TABLE ONLY id_type
 
 
 --
--- Name: id_type_pkey; Type: CONSTRAINT; Schema: party; Owner: postgres; Tablespace: 
+-- Name: id_type_pkey; Type: CONSTRAINT; Schema: party; Owner: postgres
 --
 
 ALTER TABLE ONLY id_type
@@ -15058,7 +15402,7 @@ ALTER TABLE ONLY id_type
 
 
 --
--- Name: party_member_pkey; Type: CONSTRAINT; Schema: party; Owner: postgres; Tablespace: 
+-- Name: party_member_pkey; Type: CONSTRAINT; Schema: party; Owner: postgres
 --
 
 ALTER TABLE ONLY party_member
@@ -15066,7 +15410,7 @@ ALTER TABLE ONLY party_member
 
 
 --
--- Name: party_pkey; Type: CONSTRAINT; Schema: party; Owner: postgres; Tablespace: 
+-- Name: party_pkey; Type: CONSTRAINT; Schema: party; Owner: postgres
 --
 
 ALTER TABLE ONLY party
@@ -15074,7 +15418,7 @@ ALTER TABLE ONLY party
 
 
 --
--- Name: party_role_pkey; Type: CONSTRAINT; Schema: party; Owner: postgres; Tablespace: 
+-- Name: party_role_pkey; Type: CONSTRAINT; Schema: party; Owner: postgres
 --
 
 ALTER TABLE ONLY party_role
@@ -15082,7 +15426,7 @@ ALTER TABLE ONLY party_role
 
 
 --
--- Name: party_role_type_display_value_unique; Type: CONSTRAINT; Schema: party; Owner: postgres; Tablespace: 
+-- Name: party_role_type_display_value_unique; Type: CONSTRAINT; Schema: party; Owner: postgres
 --
 
 ALTER TABLE ONLY party_role_type
@@ -15090,7 +15434,7 @@ ALTER TABLE ONLY party_role_type
 
 
 --
--- Name: party_role_type_pkey; Type: CONSTRAINT; Schema: party; Owner: postgres; Tablespace: 
+-- Name: party_role_type_pkey; Type: CONSTRAINT; Schema: party; Owner: postgres
 --
 
 ALTER TABLE ONLY party_role_type
@@ -15098,7 +15442,7 @@ ALTER TABLE ONLY party_role_type
 
 
 --
--- Name: party_type_display_value_unique; Type: CONSTRAINT; Schema: party; Owner: postgres; Tablespace: 
+-- Name: party_type_display_value_unique; Type: CONSTRAINT; Schema: party; Owner: postgres
 --
 
 ALTER TABLE ONLY party_type
@@ -15106,7 +15450,7 @@ ALTER TABLE ONLY party_type
 
 
 --
--- Name: party_type_pkey; Type: CONSTRAINT; Schema: party; Owner: postgres; Tablespace: 
+-- Name: party_type_pkey; Type: CONSTRAINT; Schema: party; Owner: postgres
 --
 
 ALTER TABLE ONLY party_type
@@ -15114,7 +15458,7 @@ ALTER TABLE ONLY party_type
 
 
 --
--- Name: source_describes_party_pkey; Type: CONSTRAINT; Schema: party; Owner: postgres; Tablespace: 
+-- Name: source_describes_party_pkey; Type: CONSTRAINT; Schema: party; Owner: postgres
 --
 
 ALTER TABLE ONLY source_describes_party
@@ -15124,7 +15468,7 @@ ALTER TABLE ONLY source_describes_party
 SET search_path = source, pg_catalog;
 
 --
--- Name: administrative_source_type_display_value_unique; Type: CONSTRAINT; Schema: source; Owner: postgres; Tablespace: 
+-- Name: administrative_source_type_display_value_unique; Type: CONSTRAINT; Schema: source; Owner: postgres
 --
 
 ALTER TABLE ONLY administrative_source_type
@@ -15132,7 +15476,7 @@ ALTER TABLE ONLY administrative_source_type
 
 
 --
--- Name: administrative_source_type_pkey; Type: CONSTRAINT; Schema: source; Owner: postgres; Tablespace: 
+-- Name: administrative_source_type_pkey; Type: CONSTRAINT; Schema: source; Owner: postgres
 --
 
 ALTER TABLE ONLY administrative_source_type
@@ -15140,7 +15484,7 @@ ALTER TABLE ONLY administrative_source_type
 
 
 --
--- Name: archive_pkey; Type: CONSTRAINT; Schema: source; Owner: postgres; Tablespace: 
+-- Name: archive_pkey; Type: CONSTRAINT; Schema: source; Owner: postgres
 --
 
 ALTER TABLE ONLY archive
@@ -15148,7 +15492,7 @@ ALTER TABLE ONLY archive
 
 
 --
--- Name: availability_status_type_display_value_unique; Type: CONSTRAINT; Schema: source; Owner: postgres; Tablespace: 
+-- Name: availability_status_type_display_value_unique; Type: CONSTRAINT; Schema: source; Owner: postgres
 --
 
 ALTER TABLE ONLY availability_status_type
@@ -15156,7 +15500,7 @@ ALTER TABLE ONLY availability_status_type
 
 
 --
--- Name: availability_status_type_pkey; Type: CONSTRAINT; Schema: source; Owner: postgres; Tablespace: 
+-- Name: availability_status_type_pkey; Type: CONSTRAINT; Schema: source; Owner: postgres
 --
 
 ALTER TABLE ONLY availability_status_type
@@ -15164,7 +15508,7 @@ ALTER TABLE ONLY availability_status_type
 
 
 --
--- Name: power_of_attorney_pkey; Type: CONSTRAINT; Schema: source; Owner: postgres; Tablespace: 
+-- Name: power_of_attorney_pkey; Type: CONSTRAINT; Schema: source; Owner: postgres
 --
 
 ALTER TABLE ONLY power_of_attorney
@@ -15172,7 +15516,7 @@ ALTER TABLE ONLY power_of_attorney
 
 
 --
--- Name: presentation_form_type_display_value_unique; Type: CONSTRAINT; Schema: source; Owner: postgres; Tablespace: 
+-- Name: presentation_form_type_display_value_unique; Type: CONSTRAINT; Schema: source; Owner: postgres
 --
 
 ALTER TABLE ONLY presentation_form_type
@@ -15180,7 +15524,7 @@ ALTER TABLE ONLY presentation_form_type
 
 
 --
--- Name: presentation_form_type_pkey; Type: CONSTRAINT; Schema: source; Owner: postgres; Tablespace: 
+-- Name: presentation_form_type_pkey; Type: CONSTRAINT; Schema: source; Owner: postgres
 --
 
 ALTER TABLE ONLY presentation_form_type
@@ -15188,7 +15532,7 @@ ALTER TABLE ONLY presentation_form_type
 
 
 --
--- Name: source_pkey; Type: CONSTRAINT; Schema: source; Owner: postgres; Tablespace: 
+-- Name: source_pkey; Type: CONSTRAINT; Schema: source; Owner: postgres
 --
 
 ALTER TABLE ONLY source
@@ -15196,7 +15540,7 @@ ALTER TABLE ONLY source
 
 
 --
--- Name: spatial_source_measurement_pkey; Type: CONSTRAINT; Schema: source; Owner: postgres; Tablespace: 
+-- Name: spatial_source_measurement_pkey; Type: CONSTRAINT; Schema: source; Owner: postgres
 --
 
 ALTER TABLE ONLY spatial_source_measurement
@@ -15204,7 +15548,7 @@ ALTER TABLE ONLY spatial_source_measurement
 
 
 --
--- Name: spatial_source_pkey; Type: CONSTRAINT; Schema: source; Owner: postgres; Tablespace: 
+-- Name: spatial_source_pkey; Type: CONSTRAINT; Schema: source; Owner: postgres
 --
 
 ALTER TABLE ONLY spatial_source
@@ -15212,7 +15556,7 @@ ALTER TABLE ONLY spatial_source
 
 
 --
--- Name: spatial_source_type_display_value_unique; Type: CONSTRAINT; Schema: source; Owner: postgres; Tablespace: 
+-- Name: spatial_source_type_display_value_unique; Type: CONSTRAINT; Schema: source; Owner: postgres
 --
 
 ALTER TABLE ONLY spatial_source_type
@@ -15220,7 +15564,7 @@ ALTER TABLE ONLY spatial_source_type
 
 
 --
--- Name: spatial_source_type_pkey; Type: CONSTRAINT; Schema: source; Owner: postgres; Tablespace: 
+-- Name: spatial_source_type_pkey; Type: CONSTRAINT; Schema: source; Owner: postgres
 --
 
 ALTER TABLE ONLY spatial_source_type
@@ -15230,7 +15574,7 @@ ALTER TABLE ONLY spatial_source_type
 SET search_path = system, pg_catalog;
 
 --
--- Name: appgroup_name_unique; Type: CONSTRAINT; Schema: system; Owner: postgres; Tablespace: 
+-- Name: appgroup_name_unique; Type: CONSTRAINT; Schema: system; Owner: postgres
 --
 
 ALTER TABLE ONLY appgroup
@@ -15238,7 +15582,7 @@ ALTER TABLE ONLY appgroup
 
 
 --
--- Name: appgroup_pkey; Type: CONSTRAINT; Schema: system; Owner: postgres; Tablespace: 
+-- Name: appgroup_pkey; Type: CONSTRAINT; Schema: system; Owner: postgres
 --
 
 ALTER TABLE ONLY appgroup
@@ -15246,7 +15590,7 @@ ALTER TABLE ONLY appgroup
 
 
 --
--- Name: approle_appgroup_pkey; Type: CONSTRAINT; Schema: system; Owner: postgres; Tablespace: 
+-- Name: approle_appgroup_pkey; Type: CONSTRAINT; Schema: system; Owner: postgres
 --
 
 ALTER TABLE ONLY approle_appgroup
@@ -15254,7 +15598,7 @@ ALTER TABLE ONLY approle_appgroup
 
 
 --
--- Name: approle_display_value_unique; Type: CONSTRAINT; Schema: system; Owner: postgres; Tablespace: 
+-- Name: approle_display_value_unique; Type: CONSTRAINT; Schema: system; Owner: postgres
 --
 
 ALTER TABLE ONLY approle
@@ -15262,7 +15606,7 @@ ALTER TABLE ONLY approle
 
 
 --
--- Name: approle_pkey; Type: CONSTRAINT; Schema: system; Owner: postgres; Tablespace: 
+-- Name: approle_pkey; Type: CONSTRAINT; Schema: system; Owner: postgres
 --
 
 ALTER TABLE ONLY approle
@@ -15270,7 +15614,7 @@ ALTER TABLE ONLY approle
 
 
 --
--- Name: appuser_appgroup_pkey; Type: CONSTRAINT; Schema: system; Owner: postgres; Tablespace: 
+-- Name: appuser_appgroup_pkey; Type: CONSTRAINT; Schema: system; Owner: postgres
 --
 
 ALTER TABLE ONLY appuser_appgroup
@@ -15278,7 +15622,7 @@ ALTER TABLE ONLY appuser_appgroup
 
 
 --
--- Name: appuser_email_unique; Type: CONSTRAINT; Schema: system; Owner: postgres; Tablespace: 
+-- Name: appuser_email_unique; Type: CONSTRAINT; Schema: system; Owner: postgres
 --
 
 ALTER TABLE ONLY appuser
@@ -15286,7 +15630,7 @@ ALTER TABLE ONLY appuser
 
 
 --
--- Name: appuser_pkey; Type: CONSTRAINT; Schema: system; Owner: postgres; Tablespace: 
+-- Name: appuser_pkey; Type: CONSTRAINT; Schema: system; Owner: postgres
 --
 
 ALTER TABLE ONLY appuser
@@ -15294,7 +15638,7 @@ ALTER TABLE ONLY appuser
 
 
 --
--- Name: appuser_setting_pkey; Type: CONSTRAINT; Schema: system; Owner: postgres; Tablespace: 
+-- Name: appuser_setting_pkey; Type: CONSTRAINT; Schema: system; Owner: postgres
 --
 
 ALTER TABLE ONLY appuser_setting
@@ -15302,7 +15646,7 @@ ALTER TABLE ONLY appuser_setting
 
 
 --
--- Name: appuser_username_unique; Type: CONSTRAINT; Schema: system; Owner: postgres; Tablespace: 
+-- Name: appuser_username_unique; Type: CONSTRAINT; Schema: system; Owner: postgres
 --
 
 ALTER TABLE ONLY appuser
@@ -15310,7 +15654,7 @@ ALTER TABLE ONLY appuser
 
 
 --
--- Name: br_definition_pkey; Type: CONSTRAINT; Schema: system; Owner: postgres; Tablespace: 
+-- Name: br_definition_pkey; Type: CONSTRAINT; Schema: system; Owner: postgres
 --
 
 ALTER TABLE ONLY br_definition
@@ -15318,7 +15662,7 @@ ALTER TABLE ONLY br_definition
 
 
 --
--- Name: br_display_name_unique; Type: CONSTRAINT; Schema: system; Owner: postgres; Tablespace: 
+-- Name: br_display_name_unique; Type: CONSTRAINT; Schema: system; Owner: postgres
 --
 
 ALTER TABLE ONLY br
@@ -15326,7 +15670,7 @@ ALTER TABLE ONLY br
 
 
 --
--- Name: br_pkey; Type: CONSTRAINT; Schema: system; Owner: postgres; Tablespace: 
+-- Name: br_pkey; Type: CONSTRAINT; Schema: system; Owner: postgres
 --
 
 ALTER TABLE ONLY br
@@ -15334,7 +15678,7 @@ ALTER TABLE ONLY br
 
 
 --
--- Name: br_severity_type_display_value_unique; Type: CONSTRAINT; Schema: system; Owner: postgres; Tablespace: 
+-- Name: br_severity_type_display_value_unique; Type: CONSTRAINT; Schema: system; Owner: postgres
 --
 
 ALTER TABLE ONLY br_severity_type
@@ -15342,7 +15686,7 @@ ALTER TABLE ONLY br_severity_type
 
 
 --
--- Name: br_severity_type_pkey; Type: CONSTRAINT; Schema: system; Owner: postgres; Tablespace: 
+-- Name: br_severity_type_pkey; Type: CONSTRAINT; Schema: system; Owner: postgres
 --
 
 ALTER TABLE ONLY br_severity_type
@@ -15350,7 +15694,7 @@ ALTER TABLE ONLY br_severity_type
 
 
 --
--- Name: br_technical_type_display_value_unique; Type: CONSTRAINT; Schema: system; Owner: postgres; Tablespace: 
+-- Name: br_technical_type_display_value_unique; Type: CONSTRAINT; Schema: system; Owner: postgres
 --
 
 ALTER TABLE ONLY br_technical_type
@@ -15358,7 +15702,7 @@ ALTER TABLE ONLY br_technical_type
 
 
 --
--- Name: br_technical_type_pkey; Type: CONSTRAINT; Schema: system; Owner: postgres; Tablespace: 
+-- Name: br_technical_type_pkey; Type: CONSTRAINT; Schema: system; Owner: postgres
 --
 
 ALTER TABLE ONLY br_technical_type
@@ -15366,7 +15710,7 @@ ALTER TABLE ONLY br_technical_type
 
 
 --
--- Name: br_validation_app_moment_unique; Type: CONSTRAINT; Schema: system; Owner: postgres; Tablespace: 
+-- Name: br_validation_app_moment_unique; Type: CONSTRAINT; Schema: system; Owner: postgres
 --
 
 ALTER TABLE ONLY br_validation
@@ -15374,7 +15718,7 @@ ALTER TABLE ONLY br_validation
 
 
 --
--- Name: br_validation_pkey; Type: CONSTRAINT; Schema: system; Owner: postgres; Tablespace: 
+-- Name: br_validation_pkey; Type: CONSTRAINT; Schema: system; Owner: postgres
 --
 
 ALTER TABLE ONLY br_validation
@@ -15382,7 +15726,7 @@ ALTER TABLE ONLY br_validation
 
 
 --
--- Name: br_validation_reg_moment_unique; Type: CONSTRAINT; Schema: system; Owner: postgres; Tablespace: 
+-- Name: br_validation_reg_moment_unique; Type: CONSTRAINT; Schema: system; Owner: postgres
 --
 
 ALTER TABLE ONLY br_validation
@@ -15390,7 +15734,7 @@ ALTER TABLE ONLY br_validation
 
 
 --
--- Name: br_validation_service_moment_unique; Type: CONSTRAINT; Schema: system; Owner: postgres; Tablespace: 
+-- Name: br_validation_service_moment_unique; Type: CONSTRAINT; Schema: system; Owner: postgres
 --
 
 ALTER TABLE ONLY br_validation
@@ -15398,7 +15742,7 @@ ALTER TABLE ONLY br_validation
 
 
 --
--- Name: br_validation_target_type_display_value_unique; Type: CONSTRAINT; Schema: system; Owner: postgres; Tablespace: 
+-- Name: br_validation_target_type_display_value_unique; Type: CONSTRAINT; Schema: system; Owner: postgres
 --
 
 ALTER TABLE ONLY br_validation_target_type
@@ -15406,7 +15750,7 @@ ALTER TABLE ONLY br_validation_target_type
 
 
 --
--- Name: br_validation_target_type_pkey; Type: CONSTRAINT; Schema: system; Owner: postgres; Tablespace: 
+-- Name: br_validation_target_type_pkey; Type: CONSTRAINT; Schema: system; Owner: postgres
 --
 
 ALTER TABLE ONLY br_validation_target_type
@@ -15414,7 +15758,7 @@ ALTER TABLE ONLY br_validation_target_type
 
 
 --
--- Name: config_map_layer_pkey; Type: CONSTRAINT; Schema: system; Owner: postgres; Tablespace: 
+-- Name: config_map_layer_pkey; Type: CONSTRAINT; Schema: system; Owner: postgres
 --
 
 ALTER TABLE ONLY config_map_layer
@@ -15422,7 +15766,7 @@ ALTER TABLE ONLY config_map_layer
 
 
 --
--- Name: config_map_layer_title_unique; Type: CONSTRAINT; Schema: system; Owner: postgres; Tablespace: 
+-- Name: config_map_layer_title_unique; Type: CONSTRAINT; Schema: system; Owner: postgres
 --
 
 ALTER TABLE ONLY config_map_layer
@@ -15430,7 +15774,7 @@ ALTER TABLE ONLY config_map_layer
 
 
 --
--- Name: config_map_layer_type_display_value_unique; Type: CONSTRAINT; Schema: system; Owner: postgres; Tablespace: 
+-- Name: config_map_layer_type_display_value_unique; Type: CONSTRAINT; Schema: system; Owner: postgres
 --
 
 ALTER TABLE ONLY config_map_layer_type
@@ -15438,7 +15782,7 @@ ALTER TABLE ONLY config_map_layer_type
 
 
 --
--- Name: config_map_layer_type_pkey; Type: CONSTRAINT; Schema: system; Owner: postgres; Tablespace: 
+-- Name: config_map_layer_type_pkey; Type: CONSTRAINT; Schema: system; Owner: postgres
 --
 
 ALTER TABLE ONLY config_map_layer_type
@@ -15446,7 +15790,7 @@ ALTER TABLE ONLY config_map_layer_type
 
 
 --
--- Name: config_panel_launcher_display_value_unique; Type: CONSTRAINT; Schema: system; Owner: postgres; Tablespace: 
+-- Name: config_panel_launcher_display_value_unique; Type: CONSTRAINT; Schema: system; Owner: postgres
 --
 
 ALTER TABLE ONLY config_panel_launcher
@@ -15454,7 +15798,7 @@ ALTER TABLE ONLY config_panel_launcher
 
 
 --
--- Name: config_panel_launcher_pkey; Type: CONSTRAINT; Schema: system; Owner: postgres; Tablespace: 
+-- Name: config_panel_launcher_pkey; Type: CONSTRAINT; Schema: system; Owner: postgres
 --
 
 ALTER TABLE ONLY config_panel_launcher
@@ -15462,7 +15806,7 @@ ALTER TABLE ONLY config_panel_launcher
 
 
 --
--- Name: consolidation_config_lkey; Type: CONSTRAINT; Schema: system; Owner: postgres; Tablespace: 
+-- Name: consolidation_config_lkey; Type: CONSTRAINT; Schema: system; Owner: postgres
 --
 
 ALTER TABLE ONLY consolidation_config
@@ -15470,7 +15814,7 @@ ALTER TABLE ONLY consolidation_config
 
 
 --
--- Name: consolidation_config_pkey; Type: CONSTRAINT; Schema: system; Owner: postgres; Tablespace: 
+-- Name: consolidation_config_pkey; Type: CONSTRAINT; Schema: system; Owner: postgres
 --
 
 ALTER TABLE ONLY consolidation_config
@@ -15478,7 +15822,7 @@ ALTER TABLE ONLY consolidation_config
 
 
 --
--- Name: crs_pkey; Type: CONSTRAINT; Schema: system; Owner: postgres; Tablespace: 
+-- Name: crs_pkey; Type: CONSTRAINT; Schema: system; Owner: postgres
 --
 
 ALTER TABLE ONLY crs
@@ -15486,7 +15830,7 @@ ALTER TABLE ONLY crs
 
 
 --
--- Name: email_pk_id; Type: CONSTRAINT; Schema: system; Owner: postgres; Tablespace: 
+-- Name: email_pk_id; Type: CONSTRAINT; Schema: system; Owner: postgres
 --
 
 ALTER TABLE ONLY email
@@ -15494,7 +15838,7 @@ ALTER TABLE ONLY email
 
 
 --
--- Name: extracted_rows_pkey; Type: CONSTRAINT; Schema: system; Owner: postgres; Tablespace: 
+-- Name: extracted_rows_pkey; Type: CONSTRAINT; Schema: system; Owner: postgres
 --
 
 ALTER TABLE ONLY extracted_rows
@@ -15502,7 +15846,7 @@ ALTER TABLE ONLY extracted_rows
 
 
 --
--- Name: language_display_value_unique; Type: CONSTRAINT; Schema: system; Owner: postgres; Tablespace: 
+-- Name: language_display_value_unique; Type: CONSTRAINT; Schema: system; Owner: postgres
 --
 
 ALTER TABLE ONLY language
@@ -15510,7 +15854,7 @@ ALTER TABLE ONLY language
 
 
 --
--- Name: language_pkey; Type: CONSTRAINT; Schema: system; Owner: postgres; Tablespace: 
+-- Name: language_pkey; Type: CONSTRAINT; Schema: system; Owner: postgres
 --
 
 ALTER TABLE ONLY language
@@ -15518,7 +15862,7 @@ ALTER TABLE ONLY language
 
 
 --
--- Name: map_search_option_pkey; Type: CONSTRAINT; Schema: system; Owner: postgres; Tablespace: 
+-- Name: map_search_option_pkey; Type: CONSTRAINT; Schema: system; Owner: postgres
 --
 
 ALTER TABLE ONLY map_search_option
@@ -15526,7 +15870,7 @@ ALTER TABLE ONLY map_search_option
 
 
 --
--- Name: map_search_option_title_unique; Type: CONSTRAINT; Schema: system; Owner: postgres; Tablespace: 
+-- Name: map_search_option_title_unique; Type: CONSTRAINT; Schema: system; Owner: postgres
 --
 
 ALTER TABLE ONLY map_search_option
@@ -15534,7 +15878,7 @@ ALTER TABLE ONLY map_search_option
 
 
 --
--- Name: panel_launcher_group_display_value_unique; Type: CONSTRAINT; Schema: system; Owner: postgres; Tablespace: 
+-- Name: panel_launcher_group_display_value_unique; Type: CONSTRAINT; Schema: system; Owner: postgres
 --
 
 ALTER TABLE ONLY panel_launcher_group
@@ -15542,7 +15886,7 @@ ALTER TABLE ONLY panel_launcher_group
 
 
 --
--- Name: panel_launcher_group_pkey; Type: CONSTRAINT; Schema: system; Owner: postgres; Tablespace: 
+-- Name: panel_launcher_group_pkey; Type: CONSTRAINT; Schema: system; Owner: postgres
 --
 
 ALTER TABLE ONLY panel_launcher_group
@@ -15550,7 +15894,7 @@ ALTER TABLE ONLY panel_launcher_group
 
 
 --
--- Name: pk_config_map_layer_metadata; Type: CONSTRAINT; Schema: system; Owner: postgres; Tablespace: 
+-- Name: pk_config_map_layer_metadata; Type: CONSTRAINT; Schema: system; Owner: postgres
 --
 
 ALTER TABLE ONLY config_map_layer_metadata
@@ -15558,7 +15902,7 @@ ALTER TABLE ONLY config_map_layer_metadata
 
 
 --
--- Name: query_field_display_value; Type: CONSTRAINT; Schema: system; Owner: postgres; Tablespace: 
+-- Name: query_field_display_value; Type: CONSTRAINT; Schema: system; Owner: postgres
 --
 
 ALTER TABLE ONLY query_field
@@ -15566,7 +15910,7 @@ ALTER TABLE ONLY query_field
 
 
 --
--- Name: query_field_name; Type: CONSTRAINT; Schema: system; Owner: postgres; Tablespace: 
+-- Name: query_field_name; Type: CONSTRAINT; Schema: system; Owner: postgres
 --
 
 ALTER TABLE ONLY query_field
@@ -15574,7 +15918,7 @@ ALTER TABLE ONLY query_field
 
 
 --
--- Name: query_field_pkey; Type: CONSTRAINT; Schema: system; Owner: postgres; Tablespace: 
+-- Name: query_field_pkey; Type: CONSTRAINT; Schema: system; Owner: postgres
 --
 
 ALTER TABLE ONLY query_field
@@ -15582,7 +15926,7 @@ ALTER TABLE ONLY query_field
 
 
 --
--- Name: query_pkey; Type: CONSTRAINT; Schema: system; Owner: postgres; Tablespace: 
+-- Name: query_pkey; Type: CONSTRAINT; Schema: system; Owner: postgres
 --
 
 ALTER TABLE ONLY query
@@ -15590,7 +15934,7 @@ ALTER TABLE ONLY query
 
 
 --
--- Name: setting_pkey; Type: CONSTRAINT; Schema: system; Owner: postgres; Tablespace: 
+-- Name: setting_pkey; Type: CONSTRAINT; Schema: system; Owner: postgres
 --
 
 ALTER TABLE ONLY setting
@@ -15598,7 +15942,7 @@ ALTER TABLE ONLY setting
 
 
 --
--- Name: version_pkey; Type: CONSTRAINT; Schema: system; Owner: postgres; Tablespace: 
+-- Name: version_pkey; Type: CONSTRAINT; Schema: system; Owner: postgres
 --
 
 ALTER TABLE ONLY version
@@ -15608,7 +15952,7 @@ ALTER TABLE ONLY version
 SET search_path = transaction, pg_catalog;
 
 --
--- Name: reg_status_type_display_value_unique; Type: CONSTRAINT; Schema: transaction; Owner: postgres; Tablespace: 
+-- Name: reg_status_type_display_value_unique; Type: CONSTRAINT; Schema: transaction; Owner: postgres
 --
 
 ALTER TABLE ONLY reg_status_type
@@ -15616,7 +15960,7 @@ ALTER TABLE ONLY reg_status_type
 
 
 --
--- Name: reg_status_type_pkey; Type: CONSTRAINT; Schema: transaction; Owner: postgres; Tablespace: 
+-- Name: reg_status_type_pkey; Type: CONSTRAINT; Schema: transaction; Owner: postgres
 --
 
 ALTER TABLE ONLY reg_status_type
@@ -15624,7 +15968,7 @@ ALTER TABLE ONLY reg_status_type
 
 
 --
--- Name: transaction_from_service_id_unique; Type: CONSTRAINT; Schema: transaction; Owner: postgres; Tablespace: 
+-- Name: transaction_from_service_id_unique; Type: CONSTRAINT; Schema: transaction; Owner: postgres
 --
 
 ALTER TABLE ONLY transaction
@@ -15632,7 +15976,7 @@ ALTER TABLE ONLY transaction
 
 
 --
--- Name: transaction_pkey; Type: CONSTRAINT; Schema: transaction; Owner: postgres; Tablespace: 
+-- Name: transaction_pkey; Type: CONSTRAINT; Schema: transaction; Owner: postgres
 --
 
 ALTER TABLE ONLY transaction
@@ -15640,7 +15984,7 @@ ALTER TABLE ONLY transaction
 
 
 --
--- Name: transaction_source_pkey; Type: CONSTRAINT; Schema: transaction; Owner: postgres; Tablespace: 
+-- Name: transaction_source_pkey; Type: CONSTRAINT; Schema: transaction; Owner: postgres
 --
 
 ALTER TABLE ONLY transaction_source
@@ -15648,7 +15992,7 @@ ALTER TABLE ONLY transaction_source
 
 
 --
--- Name: transaction_status_type_display_value_unique; Type: CONSTRAINT; Schema: transaction; Owner: postgres; Tablespace: 
+-- Name: transaction_status_type_display_value_unique; Type: CONSTRAINT; Schema: transaction; Owner: postgres
 --
 
 ALTER TABLE ONLY transaction_status_type
@@ -15656,7 +16000,7 @@ ALTER TABLE ONLY transaction_status_type
 
 
 --
--- Name: transaction_status_type_pkey; Type: CONSTRAINT; Schema: transaction; Owner: postgres; Tablespace: 
+-- Name: transaction_status_type_pkey; Type: CONSTRAINT; Schema: transaction; Owner: postgres
 --
 
 ALTER TABLE ONLY transaction_status_type
@@ -15666,14 +16010,14 @@ ALTER TABLE ONLY transaction_status_type
 SET search_path = address, pg_catalog;
 
 --
--- Name: address_historic_index_on_rowidentifier; Type: INDEX; Schema: address; Owner: postgres; Tablespace: 
+-- Name: address_historic_index_on_rowidentifier; Type: INDEX; Schema: address; Owner: postgres
 --
 
 CREATE INDEX address_historic_index_on_rowidentifier ON address_historic USING btree (rowidentifier);
 
 
 --
--- Name: address_index_on_rowidentifier; Type: INDEX; Schema: address; Owner: postgres; Tablespace: 
+-- Name: address_index_on_rowidentifier; Type: INDEX; Schema: address; Owner: postgres
 --
 
 CREATE INDEX address_index_on_rowidentifier ON address USING btree (rowidentifier);
@@ -15682,448 +16026,448 @@ CREATE INDEX address_index_on_rowidentifier ON address USING btree (rowidentifie
 SET search_path = administrative, pg_catalog;
 
 --
--- Name: ba_unit_area_ba_unit_id_fk77_ind; Type: INDEX; Schema: administrative; Owner: postgres; Tablespace: 
+-- Name: ba_unit_area_ba_unit_id_fk77_ind; Type: INDEX; Schema: administrative; Owner: postgres
 --
 
 CREATE INDEX ba_unit_area_ba_unit_id_fk77_ind ON ba_unit_area USING btree (ba_unit_id);
 
 
 --
--- Name: ba_unit_area_historic_index_on_rowidentifier; Type: INDEX; Schema: administrative; Owner: postgres; Tablespace: 
+-- Name: ba_unit_area_historic_index_on_rowidentifier; Type: INDEX; Schema: administrative; Owner: postgres
 --
 
 CREATE INDEX ba_unit_area_historic_index_on_rowidentifier ON ba_unit_area_historic USING btree (rowidentifier);
 
 
 --
--- Name: ba_unit_area_index_on_rowidentifier; Type: INDEX; Schema: administrative; Owner: postgres; Tablespace: 
+-- Name: ba_unit_area_index_on_rowidentifier; Type: INDEX; Schema: administrative; Owner: postgres
 --
 
 CREATE INDEX ba_unit_area_index_on_rowidentifier ON ba_unit_area USING btree (rowidentifier);
 
 
 --
--- Name: ba_unit_area_type_code_fk78_ind; Type: INDEX; Schema: administrative; Owner: postgres; Tablespace: 
+-- Name: ba_unit_area_type_code_fk78_ind; Type: INDEX; Schema: administrative; Owner: postgres
 --
 
 CREATE INDEX ba_unit_area_type_code_fk78_ind ON ba_unit_area USING btree (type_code);
 
 
 --
--- Name: ba_unit_as_party_ba_unit_id_fk71_ind; Type: INDEX; Schema: administrative; Owner: postgres; Tablespace: 
+-- Name: ba_unit_as_party_ba_unit_id_fk71_ind; Type: INDEX; Schema: administrative; Owner: postgres
 --
 
 CREATE INDEX ba_unit_as_party_ba_unit_id_fk71_ind ON ba_unit_as_party USING btree (ba_unit_id);
 
 
 --
--- Name: ba_unit_as_party_party_id_fk72_ind; Type: INDEX; Schema: administrative; Owner: postgres; Tablespace: 
+-- Name: ba_unit_as_party_party_id_fk72_ind; Type: INDEX; Schema: administrative; Owner: postgres
 --
 
 CREATE INDEX ba_unit_as_party_party_id_fk72_ind ON ba_unit_as_party USING btree (party_id);
 
 
 --
--- Name: ba_unit_contains_spatial_unit_ba_unit_id_fk68_ind; Type: INDEX; Schema: administrative; Owner: postgres; Tablespace: 
+-- Name: ba_unit_contains_spatial_unit_ba_unit_id_fk68_ind; Type: INDEX; Schema: administrative; Owner: postgres
 --
 
 CREATE INDEX ba_unit_contains_spatial_unit_ba_unit_id_fk68_ind ON ba_unit_contains_spatial_unit USING btree (ba_unit_id);
 
 
 --
--- Name: ba_unit_contains_spatial_unit_historic_index_on_rowidentifier; Type: INDEX; Schema: administrative; Owner: postgres; Tablespace: 
+-- Name: ba_unit_contains_spatial_unit_historic_index_on_rowidentifier; Type: INDEX; Schema: administrative; Owner: postgres
 --
 
 CREATE INDEX ba_unit_contains_spatial_unit_historic_index_on_rowidentifier ON ba_unit_contains_spatial_unit_historic USING btree (rowidentifier);
 
 
 --
--- Name: ba_unit_contains_spatial_unit_index_on_rowidentifier; Type: INDEX; Schema: administrative; Owner: postgres; Tablespace: 
+-- Name: ba_unit_contains_spatial_unit_index_on_rowidentifier; Type: INDEX; Schema: administrative; Owner: postgres
 --
 
 CREATE INDEX ba_unit_contains_spatial_unit_index_on_rowidentifier ON ba_unit_contains_spatial_unit USING btree (rowidentifier);
 
 
 --
--- Name: ba_unit_contains_spatial_unit_spatial_unit_id_fk69_ind; Type: INDEX; Schema: administrative; Owner: postgres; Tablespace: 
+-- Name: ba_unit_contains_spatial_unit_spatial_unit_id_fk69_ind; Type: INDEX; Schema: administrative; Owner: postgres
 --
 
 CREATE INDEX ba_unit_contains_spatial_unit_spatial_unit_id_fk69_ind ON ba_unit_contains_spatial_unit USING btree (spatial_unit_id);
 
 
 --
--- Name: ba_unit_contains_spatial_unit_spatial_unit_id_fk70_ind; Type: INDEX; Schema: administrative; Owner: postgres; Tablespace: 
+-- Name: ba_unit_contains_spatial_unit_spatial_unit_id_fk70_ind; Type: INDEX; Schema: administrative; Owner: postgres
 --
 
 CREATE INDEX ba_unit_contains_spatial_unit_spatial_unit_id_fk70_ind ON ba_unit_contains_spatial_unit USING btree (spatial_unit_id);
 
 
 --
--- Name: ba_unit_historic_index_on_rowidentifier; Type: INDEX; Schema: administrative; Owner: postgres; Tablespace: 
+-- Name: ba_unit_historic_index_on_rowidentifier; Type: INDEX; Schema: administrative; Owner: postgres
 --
 
 CREATE INDEX ba_unit_historic_index_on_rowidentifier ON ba_unit_historic USING btree (rowidentifier);
 
 
 --
--- Name: ba_unit_index_on_rowidentifier; Type: INDEX; Schema: administrative; Owner: postgres; Tablespace: 
+-- Name: ba_unit_index_on_rowidentifier; Type: INDEX; Schema: administrative; Owner: postgres
 --
 
 CREATE INDEX ba_unit_index_on_rowidentifier ON ba_unit USING btree (rowidentifier);
 
 
 --
--- Name: ba_unit_status_code_fk39_ind; Type: INDEX; Schema: administrative; Owner: postgres; Tablespace: 
+-- Name: ba_unit_status_code_fk39_ind; Type: INDEX; Schema: administrative; Owner: postgres
 --
 
 CREATE INDEX ba_unit_status_code_fk39_ind ON ba_unit USING btree (status_code);
 
 
 --
--- Name: ba_unit_target_ba_unit_id_fk83_ind; Type: INDEX; Schema: administrative; Owner: postgres; Tablespace: 
+-- Name: ba_unit_target_ba_unit_id_fk83_ind; Type: INDEX; Schema: administrative; Owner: postgres
 --
 
 CREATE INDEX ba_unit_target_ba_unit_id_fk83_ind ON ba_unit_target USING btree (ba_unit_id);
 
 
 --
--- Name: ba_unit_target_historic_index_on_rowidentifier; Type: INDEX; Schema: administrative; Owner: postgres; Tablespace: 
+-- Name: ba_unit_target_historic_index_on_rowidentifier; Type: INDEX; Schema: administrative; Owner: postgres
 --
 
 CREATE INDEX ba_unit_target_historic_index_on_rowidentifier ON ba_unit_target_historic USING btree (rowidentifier);
 
 
 --
--- Name: ba_unit_target_index_on_rowidentifier; Type: INDEX; Schema: administrative; Owner: postgres; Tablespace: 
+-- Name: ba_unit_target_index_on_rowidentifier; Type: INDEX; Schema: administrative; Owner: postgres
 --
 
 CREATE INDEX ba_unit_target_index_on_rowidentifier ON ba_unit_target USING btree (rowidentifier);
 
 
 --
--- Name: ba_unit_target_transaction_id_fk84_ind; Type: INDEX; Schema: administrative; Owner: postgres; Tablespace: 
+-- Name: ba_unit_target_transaction_id_fk84_ind; Type: INDEX; Schema: administrative; Owner: postgres
 --
 
 CREATE INDEX ba_unit_target_transaction_id_fk84_ind ON ba_unit_target USING btree (transaction_id);
 
 
 --
--- Name: ba_unit_transaction_id_fk40_ind; Type: INDEX; Schema: administrative; Owner: postgres; Tablespace: 
+-- Name: ba_unit_transaction_id_fk40_ind; Type: INDEX; Schema: administrative; Owner: postgres
 --
 
 CREATE INDEX ba_unit_transaction_id_fk40_ind ON ba_unit USING btree (transaction_id);
 
 
 --
--- Name: ba_unit_type_code_fk38_ind; Type: INDEX; Schema: administrative; Owner: postgres; Tablespace: 
+-- Name: ba_unit_type_code_fk38_ind; Type: INDEX; Schema: administrative; Owner: postgres
 --
 
 CREATE INDEX ba_unit_type_code_fk38_ind ON ba_unit USING btree (type_code);
 
 
 --
--- Name: condition_for_rrr_condition_code_fk85_ind; Type: INDEX; Schema: administrative; Owner: postgres; Tablespace: 
+-- Name: condition_for_rrr_condition_code_fk85_ind; Type: INDEX; Schema: administrative; Owner: postgres
 --
 
 CREATE INDEX condition_for_rrr_condition_code_fk85_ind ON condition_for_rrr USING btree (condition_code);
 
 
 --
--- Name: condition_for_rrr_historic_index_on_rowidentifier; Type: INDEX; Schema: administrative; Owner: postgres; Tablespace: 
+-- Name: condition_for_rrr_historic_index_on_rowidentifier; Type: INDEX; Schema: administrative; Owner: postgres
 --
 
 CREATE INDEX condition_for_rrr_historic_index_on_rowidentifier ON condition_for_rrr_historic USING btree (rowidentifier);
 
 
 --
--- Name: condition_for_rrr_index_on_rowidentifier; Type: INDEX; Schema: administrative; Owner: postgres; Tablespace: 
+-- Name: condition_for_rrr_index_on_rowidentifier; Type: INDEX; Schema: administrative; Owner: postgres
 --
 
 CREATE INDEX condition_for_rrr_index_on_rowidentifier ON condition_for_rrr USING btree (rowidentifier);
 
 
 --
--- Name: condition_for_rrr_rrr_id_fk86_ind; Type: INDEX; Schema: administrative; Owner: postgres; Tablespace: 
+-- Name: condition_for_rrr_rrr_id_fk86_ind; Type: INDEX; Schema: administrative; Owner: postgres
 --
 
 CREATE INDEX condition_for_rrr_rrr_id_fk86_ind ON condition_for_rrr USING btree (rrr_id);
 
 
 --
--- Name: mortgage_isbased_in_rrr_historic_index_on_rowidentifier; Type: INDEX; Schema: administrative; Owner: postgres; Tablespace: 
+-- Name: mortgage_isbased_in_rrr_historic_index_on_rowidentifier; Type: INDEX; Schema: administrative; Owner: postgres
 --
 
 CREATE INDEX mortgage_isbased_in_rrr_historic_index_on_rowidentifier ON mortgage_isbased_in_rrr_historic USING btree (rowidentifier);
 
 
 --
--- Name: mortgage_isbased_in_rrr_index_on_rowidentifier; Type: INDEX; Schema: administrative; Owner: postgres; Tablespace: 
+-- Name: mortgage_isbased_in_rrr_index_on_rowidentifier; Type: INDEX; Schema: administrative; Owner: postgres
 --
 
 CREATE INDEX mortgage_isbased_in_rrr_index_on_rowidentifier ON mortgage_isbased_in_rrr USING btree (rowidentifier);
 
 
 --
--- Name: mortgage_isbased_in_rrr_mortgage_id_fk47_ind; Type: INDEX; Schema: administrative; Owner: postgres; Tablespace: 
+-- Name: mortgage_isbased_in_rrr_mortgage_id_fk47_ind; Type: INDEX; Schema: administrative; Owner: postgres
 --
 
 CREATE INDEX mortgage_isbased_in_rrr_mortgage_id_fk47_ind ON mortgage_isbased_in_rrr USING btree (mortgage_id);
 
 
 --
--- Name: mortgage_isbased_in_rrr_rrr_id_fk46_ind; Type: INDEX; Schema: administrative; Owner: postgres; Tablespace: 
+-- Name: mortgage_isbased_in_rrr_rrr_id_fk46_ind; Type: INDEX; Schema: administrative; Owner: postgres
 --
 
 CREATE INDEX mortgage_isbased_in_rrr_rrr_id_fk46_ind ON mortgage_isbased_in_rrr USING btree (rrr_id);
 
 
 --
--- Name: notation_ba_unit_id_fk75_ind; Type: INDEX; Schema: administrative; Owner: postgres; Tablespace: 
+-- Name: notation_ba_unit_id_fk75_ind; Type: INDEX; Schema: administrative; Owner: postgres
 --
 
 CREATE INDEX notation_ba_unit_id_fk75_ind ON notation USING btree (ba_unit_id);
 
 
 --
--- Name: notation_historic_index_on_rowidentifier; Type: INDEX; Schema: administrative; Owner: postgres; Tablespace: 
+-- Name: notation_historic_index_on_rowidentifier; Type: INDEX; Schema: administrative; Owner: postgres
 --
 
 CREATE INDEX notation_historic_index_on_rowidentifier ON notation_historic USING btree (rowidentifier);
 
 
 --
--- Name: notation_index_on_rowidentifier; Type: INDEX; Schema: administrative; Owner: postgres; Tablespace: 
+-- Name: notation_index_on_rowidentifier; Type: INDEX; Schema: administrative; Owner: postgres
 --
 
 CREATE INDEX notation_index_on_rowidentifier ON notation USING btree (rowidentifier);
 
 
 --
--- Name: notation_rrr_id_fk76_ind; Type: INDEX; Schema: administrative; Owner: postgres; Tablespace: 
+-- Name: notation_rrr_id_fk76_ind; Type: INDEX; Schema: administrative; Owner: postgres
 --
 
 CREATE INDEX notation_rrr_id_fk76_ind ON notation USING btree (rrr_id);
 
 
 --
--- Name: notation_status_code_fk74_ind; Type: INDEX; Schema: administrative; Owner: postgres; Tablespace: 
+-- Name: notation_status_code_fk74_ind; Type: INDEX; Schema: administrative; Owner: postgres
 --
 
 CREATE INDEX notation_status_code_fk74_ind ON notation USING btree (status_code);
 
 
 --
--- Name: notation_transaction_id_fk73_ind; Type: INDEX; Schema: administrative; Owner: postgres; Tablespace: 
+-- Name: notation_transaction_id_fk73_ind; Type: INDEX; Schema: administrative; Owner: postgres
 --
 
 CREATE INDEX notation_transaction_id_fk73_ind ON notation USING btree (transaction_id);
 
 
 --
--- Name: party_for_rrr_historic_index_on_rowidentifier; Type: INDEX; Schema: administrative; Owner: postgres; Tablespace: 
+-- Name: party_for_rrr_historic_index_on_rowidentifier; Type: INDEX; Schema: administrative; Owner: postgres
 --
 
 CREATE INDEX party_for_rrr_historic_index_on_rowidentifier ON party_for_rrr_historic USING btree (rowidentifier);
 
 
 --
--- Name: party_for_rrr_index_on_rowidentifier; Type: INDEX; Schema: administrative; Owner: postgres; Tablespace: 
+-- Name: party_for_rrr_index_on_rowidentifier; Type: INDEX; Schema: administrative; Owner: postgres
 --
 
 CREATE INDEX party_for_rrr_index_on_rowidentifier ON party_for_rrr USING btree (rowidentifier);
 
 
 --
--- Name: party_for_rrr_party_id_fk82_ind; Type: INDEX; Schema: administrative; Owner: postgres; Tablespace: 
+-- Name: party_for_rrr_party_id_fk82_ind; Type: INDEX; Schema: administrative; Owner: postgres
 --
 
 CREATE INDEX party_for_rrr_party_id_fk82_ind ON party_for_rrr USING btree (party_id);
 
 
 --
--- Name: party_for_rrr_rrr_id_fk80_ind; Type: INDEX; Schema: administrative; Owner: postgres; Tablespace: 
+-- Name: party_for_rrr_rrr_id_fk80_ind; Type: INDEX; Schema: administrative; Owner: postgres
 --
 
 CREATE INDEX party_for_rrr_rrr_id_fk80_ind ON party_for_rrr USING btree (rrr_id, share_id);
 
 
 --
--- Name: party_for_rrr_rrr_id_fk81_ind; Type: INDEX; Schema: administrative; Owner: postgres; Tablespace: 
+-- Name: party_for_rrr_rrr_id_fk81_ind; Type: INDEX; Schema: administrative; Owner: postgres
 --
 
 CREATE INDEX party_for_rrr_rrr_id_fk81_ind ON party_for_rrr USING btree (rrr_id);
 
 
 --
--- Name: required_relationship_baunit_from_ba_unit_id_fk52_ind; Type: INDEX; Schema: administrative; Owner: postgres; Tablespace: 
+-- Name: required_relationship_baunit_from_ba_unit_id_fk52_ind; Type: INDEX; Schema: administrative; Owner: postgres
 --
 
 CREATE INDEX required_relationship_baunit_from_ba_unit_id_fk52_ind ON required_relationship_baunit USING btree (from_ba_unit_id);
 
 
 --
--- Name: required_relationship_baunit_historic_index_on_rowidentifier; Type: INDEX; Schema: administrative; Owner: postgres; Tablespace: 
+-- Name: required_relationship_baunit_historic_index_on_rowidentifier; Type: INDEX; Schema: administrative; Owner: postgres
 --
 
 CREATE INDEX required_relationship_baunit_historic_index_on_rowidentifier ON required_relationship_baunit_historic USING btree (rowidentifier);
 
 
 --
--- Name: required_relationship_baunit_index_on_rowidentifier; Type: INDEX; Schema: administrative; Owner: postgres; Tablespace: 
+-- Name: required_relationship_baunit_index_on_rowidentifier; Type: INDEX; Schema: administrative; Owner: postgres
 --
 
 CREATE INDEX required_relationship_baunit_index_on_rowidentifier ON required_relationship_baunit USING btree (rowidentifier);
 
 
 --
--- Name: required_relationship_baunit_relation_code_fk54_ind; Type: INDEX; Schema: administrative; Owner: postgres; Tablespace: 
+-- Name: required_relationship_baunit_relation_code_fk54_ind; Type: INDEX; Schema: administrative; Owner: postgres
 --
 
 CREATE INDEX required_relationship_baunit_relation_code_fk54_ind ON required_relationship_baunit USING btree (relation_code);
 
 
 --
--- Name: required_relationship_baunit_to_ba_unit_id_fk53_ind; Type: INDEX; Schema: administrative; Owner: postgres; Tablespace: 
+-- Name: required_relationship_baunit_to_ba_unit_id_fk53_ind; Type: INDEX; Schema: administrative; Owner: postgres
 --
 
 CREATE INDEX required_relationship_baunit_to_ba_unit_id_fk53_ind ON required_relationship_baunit USING btree (to_ba_unit_id);
 
 
 --
--- Name: rrr_ba_unit_id_fk42_ind; Type: INDEX; Schema: administrative; Owner: postgres; Tablespace: 
+-- Name: rrr_ba_unit_id_fk42_ind; Type: INDEX; Schema: administrative; Owner: postgres
 --
 
 CREATE INDEX rrr_ba_unit_id_fk42_ind ON rrr USING btree (ba_unit_id);
 
 
 --
--- Name: rrr_historic_index_on_rowidentifier; Type: INDEX; Schema: administrative; Owner: postgres; Tablespace: 
+-- Name: rrr_historic_index_on_rowidentifier; Type: INDEX; Schema: administrative; Owner: postgres
 --
 
 CREATE INDEX rrr_historic_index_on_rowidentifier ON rrr_historic USING btree (rowidentifier);
 
 
 --
--- Name: rrr_index_on_rowidentifier; Type: INDEX; Schema: administrative; Owner: postgres; Tablespace: 
+-- Name: rrr_index_on_rowidentifier; Type: INDEX; Schema: administrative; Owner: postgres
 --
 
 CREATE INDEX rrr_index_on_rowidentifier ON rrr USING btree (rowidentifier);
 
 
 --
--- Name: rrr_mortgage_type_code_fk45_ind; Type: INDEX; Schema: administrative; Owner: postgres; Tablespace: 
+-- Name: rrr_mortgage_type_code_fk45_ind; Type: INDEX; Schema: administrative; Owner: postgres
 --
 
 CREATE INDEX rrr_mortgage_type_code_fk45_ind ON rrr USING btree (mortgage_type_code);
 
 
 --
--- Name: rrr_share_historic_index_on_rowidentifier; Type: INDEX; Schema: administrative; Owner: postgres; Tablespace: 
+-- Name: rrr_share_historic_index_on_rowidentifier; Type: INDEX; Schema: administrative; Owner: postgres
 --
 
 CREATE INDEX rrr_share_historic_index_on_rowidentifier ON rrr_share_historic USING btree (rowidentifier);
 
 
 --
--- Name: rrr_share_index_on_rowidentifier; Type: INDEX; Schema: administrative; Owner: postgres; Tablespace: 
+-- Name: rrr_share_index_on_rowidentifier; Type: INDEX; Schema: administrative; Owner: postgres
 --
 
 CREATE INDEX rrr_share_index_on_rowidentifier ON rrr_share USING btree (rowidentifier);
 
 
 --
--- Name: rrr_share_rrr_id_fk79_ind; Type: INDEX; Schema: administrative; Owner: postgres; Tablespace: 
+-- Name: rrr_share_rrr_id_fk79_ind; Type: INDEX; Schema: administrative; Owner: postgres
 --
 
 CREATE INDEX rrr_share_rrr_id_fk79_ind ON rrr_share USING btree (rrr_id);
 
 
 --
--- Name: rrr_status_code_fk43_ind; Type: INDEX; Schema: administrative; Owner: postgres; Tablespace: 
+-- Name: rrr_status_code_fk43_ind; Type: INDEX; Schema: administrative; Owner: postgres
 --
 
 CREATE INDEX rrr_status_code_fk43_ind ON rrr USING btree (status_code);
 
 
 --
--- Name: rrr_transaction_id_fk44_ind; Type: INDEX; Schema: administrative; Owner: postgres; Tablespace: 
+-- Name: rrr_transaction_id_fk44_ind; Type: INDEX; Schema: administrative; Owner: postgres
 --
 
 CREATE INDEX rrr_transaction_id_fk44_ind ON rrr USING btree (transaction_id);
 
 
 --
--- Name: rrr_type_code_fk41_ind; Type: INDEX; Schema: administrative; Owner: postgres; Tablespace: 
+-- Name: rrr_type_code_fk41_ind; Type: INDEX; Schema: administrative; Owner: postgres
 --
 
 CREATE INDEX rrr_type_code_fk41_ind ON rrr USING btree (type_code);
 
 
 --
--- Name: rrr_type_config_panel_launcher_fkey_ind; Type: INDEX; Schema: administrative; Owner: postgres; Tablespace: 
+-- Name: rrr_type_config_panel_launcher_fkey_ind; Type: INDEX; Schema: administrative; Owner: postgres
 --
 
 CREATE INDEX rrr_type_config_panel_launcher_fkey_ind ON rrr_type USING btree (rrr_panel_code);
 
 
 --
--- Name: rrr_type_rrr_group_type_code_fk22_ind; Type: INDEX; Schema: administrative; Owner: postgres; Tablespace: 
+-- Name: rrr_type_rrr_group_type_code_fk22_ind; Type: INDEX; Schema: administrative; Owner: postgres
 --
 
 CREATE INDEX rrr_type_rrr_group_type_code_fk22_ind ON rrr_type USING btree (rrr_group_type_code);
 
 
 --
--- Name: source_describes_ba_unit_ba_unit_id_fk50_ind; Type: INDEX; Schema: administrative; Owner: postgres; Tablespace: 
+-- Name: source_describes_ba_unit_ba_unit_id_fk50_ind; Type: INDEX; Schema: administrative; Owner: postgres
 --
 
 CREATE INDEX source_describes_ba_unit_ba_unit_id_fk50_ind ON source_describes_ba_unit USING btree (ba_unit_id);
 
 
 --
--- Name: source_describes_ba_unit_historic_index_on_rowidentifier; Type: INDEX; Schema: administrative; Owner: postgres; Tablespace: 
+-- Name: source_describes_ba_unit_historic_index_on_rowidentifier; Type: INDEX; Schema: administrative; Owner: postgres
 --
 
 CREATE INDEX source_describes_ba_unit_historic_index_on_rowidentifier ON source_describes_ba_unit_historic USING btree (rowidentifier);
 
 
 --
--- Name: source_describes_ba_unit_index_on_rowidentifier; Type: INDEX; Schema: administrative; Owner: postgres; Tablespace: 
+-- Name: source_describes_ba_unit_index_on_rowidentifier; Type: INDEX; Schema: administrative; Owner: postgres
 --
 
 CREATE INDEX source_describes_ba_unit_index_on_rowidentifier ON source_describes_ba_unit USING btree (rowidentifier);
 
 
 --
--- Name: source_describes_ba_unit_source_id_fk51_ind; Type: INDEX; Schema: administrative; Owner: postgres; Tablespace: 
+-- Name: source_describes_ba_unit_source_id_fk51_ind; Type: INDEX; Schema: administrative; Owner: postgres
 --
 
 CREATE INDEX source_describes_ba_unit_source_id_fk51_ind ON source_describes_ba_unit USING btree (source_id);
 
 
 --
--- Name: source_describes_rrr_historic_index_on_rowidentifier; Type: INDEX; Schema: administrative; Owner: postgres; Tablespace: 
+-- Name: source_describes_rrr_historic_index_on_rowidentifier; Type: INDEX; Schema: administrative; Owner: postgres
 --
 
 CREATE INDEX source_describes_rrr_historic_index_on_rowidentifier ON source_describes_rrr_historic USING btree (rowidentifier);
 
 
 --
--- Name: source_describes_rrr_index_on_rowidentifier; Type: INDEX; Schema: administrative; Owner: postgres; Tablespace: 
+-- Name: source_describes_rrr_index_on_rowidentifier; Type: INDEX; Schema: administrative; Owner: postgres
 --
 
 CREATE INDEX source_describes_rrr_index_on_rowidentifier ON source_describes_rrr USING btree (rowidentifier);
 
 
 --
--- Name: source_describes_rrr_rrr_id_fk48_ind; Type: INDEX; Schema: administrative; Owner: postgres; Tablespace: 
+-- Name: source_describes_rrr_rrr_id_fk48_ind; Type: INDEX; Schema: administrative; Owner: postgres
 --
 
 CREATE INDEX source_describes_rrr_rrr_id_fk48_ind ON source_describes_rrr USING btree (rrr_id);
 
 
 --
--- Name: source_describes_rrr_source_id_fk49_ind; Type: INDEX; Schema: administrative; Owner: postgres; Tablespace: 
+-- Name: source_describes_rrr_source_id_fk49_ind; Type: INDEX; Schema: administrative; Owner: postgres
 --
 
 CREATE INDEX source_describes_rrr_source_id_fk49_ind ON source_describes_rrr USING btree (source_id);
@@ -16132,797 +16476,849 @@ CREATE INDEX source_describes_rrr_source_id_fk49_ind ON source_describes_rrr USI
 SET search_path = application, pg_catalog;
 
 --
--- Name: application_action_code_fk16_ind; Type: INDEX; Schema: application; Owner: postgres; Tablespace: 
+-- Name: application_action_code_fk16_ind; Type: INDEX; Schema: application; Owner: postgres
 --
 
 CREATE INDEX application_action_code_fk16_ind ON application USING btree (action_code);
 
 
 --
--- Name: application_action_type_status_to_set_fk17_ind; Type: INDEX; Schema: application; Owner: postgres; Tablespace: 
+-- Name: application_action_type_status_to_set_fk17_ind; Type: INDEX; Schema: application; Owner: postgres
 --
 
 CREATE INDEX application_action_type_status_to_set_fk17_ind ON application_action_type USING btree (status_to_set);
 
 
 --
--- Name: application_agent_id_fk8_ind; Type: INDEX; Schema: application; Owner: postgres; Tablespace: 
+-- Name: application_agent_id_fk8_ind; Type: INDEX; Schema: application; Owner: postgres
 --
 
 CREATE INDEX application_agent_id_fk8_ind ON application USING btree (agent_id);
 
 
 --
--- Name: application_assignee_id_fk15_ind; Type: INDEX; Schema: application; Owner: postgres; Tablespace: 
+-- Name: application_assignee_id_fk15_ind; Type: INDEX; Schema: application; Owner: postgres
 --
 
 CREATE INDEX application_assignee_id_fk15_ind ON application USING btree (assignee_id);
 
 
 --
--- Name: application_contact_person_id_fk14_ind; Type: INDEX; Schema: application; Owner: postgres; Tablespace: 
+-- Name: application_contact_person_id_fk14_ind; Type: INDEX; Schema: application; Owner: postgres
 --
 
 CREATE INDEX application_contact_person_id_fk14_ind ON application USING btree (contact_person_id);
 
 
 --
--- Name: application_historic_id_idx; Type: INDEX; Schema: application; Owner: postgres; Tablespace: 
+-- Name: application_historic_id_idx; Type: INDEX; Schema: application; Owner: postgres
 --
 
 CREATE INDEX application_historic_id_idx ON application_historic USING btree (id);
 
 
 --
--- Name: application_historic_id_ind; Type: INDEX; Schema: application; Owner: postgres; Tablespace: 
+-- Name: application_historic_id_ind; Type: INDEX; Schema: application; Owner: postgres
 --
 
 CREATE INDEX application_historic_id_ind ON application_historic USING btree (id);
 
 
 --
--- Name: application_historic_index_on_location; Type: INDEX; Schema: application; Owner: postgres; Tablespace: 
+-- Name: application_historic_index_on_location; Type: INDEX; Schema: application; Owner: postgres
 --
 
 CREATE INDEX application_historic_index_on_location ON application_historic USING gist (location);
 
 
 --
--- Name: application_historic_index_on_rowidentifier; Type: INDEX; Schema: application; Owner: postgres; Tablespace: 
+-- Name: application_historic_index_on_rowidentifier; Type: INDEX; Schema: application; Owner: postgres
 --
 
 CREATE INDEX application_historic_index_on_rowidentifier ON application_historic USING btree (rowidentifier);
 
 
 --
--- Name: application_index_on_location; Type: INDEX; Schema: application; Owner: postgres; Tablespace: 
+-- Name: application_index_on_location; Type: INDEX; Schema: application; Owner: postgres
 --
 
 CREATE INDEX application_index_on_location ON application USING gist (location);
 
 
 --
--- Name: application_index_on_rowidentifier; Type: INDEX; Schema: application; Owner: postgres; Tablespace: 
+-- Name: application_index_on_rowidentifier; Type: INDEX; Schema: application; Owner: postgres
 --
 
 CREATE INDEX application_index_on_rowidentifier ON application USING btree (rowidentifier);
 
 
 --
--- Name: application_property_application_id_fk123_ind; Type: INDEX; Schema: application; Owner: postgres; Tablespace: 
+-- Name: application_property_application_id_fk123_ind; Type: INDEX; Schema: application; Owner: postgres
 --
 
 CREATE INDEX application_property_application_id_fk123_ind ON application_property USING btree (application_id);
 
 
 --
--- Name: application_property_ba_unit_id_fk124_ind; Type: INDEX; Schema: application; Owner: postgres; Tablespace: 
+-- Name: application_property_ba_unit_id_fk124_ind; Type: INDEX; Schema: application; Owner: postgres
 --
 
 CREATE INDEX application_property_ba_unit_id_fk124_ind ON application_property USING btree (ba_unit_id);
 
 
 --
--- Name: application_property_historic_index_on_rowidentifier; Type: INDEX; Schema: application; Owner: postgres; Tablespace: 
+-- Name: application_property_historic_index_on_rowidentifier; Type: INDEX; Schema: application; Owner: postgres
 --
 
 CREATE INDEX application_property_historic_index_on_rowidentifier ON application_property_historic USING btree (rowidentifier);
 
 
 --
--- Name: application_property_index_on_rowidentifier; Type: INDEX; Schema: application; Owner: postgres; Tablespace: 
+-- Name: application_property_index_on_rowidentifier; Type: INDEX; Schema: application; Owner: postgres
 --
 
 CREATE INDEX application_property_index_on_rowidentifier ON application_property USING btree (rowidentifier);
 
 
 --
--- Name: application_property_land_use_code_fk125_ind; Type: INDEX; Schema: application; Owner: postgres; Tablespace: 
+-- Name: application_property_land_use_code_fk125_ind; Type: INDEX; Schema: application; Owner: postgres
 --
 
 CREATE INDEX application_property_land_use_code_fk125_ind ON application_property USING btree (land_use_code);
 
 
 --
--- Name: application_spatial_unit_application_id_fk130_ind; Type: INDEX; Schema: application; Owner: postgres; Tablespace: 
+-- Name: application_spatial_unit_application_id_fk130_ind; Type: INDEX; Schema: application; Owner: postgres
 --
 
 CREATE INDEX application_spatial_unit_application_id_fk130_ind ON application_spatial_unit USING btree (application_id);
 
 
 --
--- Name: application_spatial_unit_historic_index_on_rowidentifier; Type: INDEX; Schema: application; Owner: postgres; Tablespace: 
+-- Name: application_spatial_unit_historic_index_on_rowidentifier; Type: INDEX; Schema: application; Owner: postgres
 --
 
 CREATE INDEX application_spatial_unit_historic_index_on_rowidentifier ON application_spatial_unit_historic USING btree (rowidentifier);
 
 
 --
--- Name: application_spatial_unit_index_on_rowidentifier; Type: INDEX; Schema: application; Owner: postgres; Tablespace: 
+-- Name: application_spatial_unit_index_on_rowidentifier; Type: INDEX; Schema: application; Owner: postgres
 --
 
 CREATE INDEX application_spatial_unit_index_on_rowidentifier ON application_spatial_unit USING btree (rowidentifier);
 
 
 --
--- Name: application_spatial_unit_spatial_unit_id_fk131_ind; Type: INDEX; Schema: application; Owner: postgres; Tablespace: 
+-- Name: application_spatial_unit_spatial_unit_id_fk131_ind; Type: INDEX; Schema: application; Owner: postgres
 --
 
 CREATE INDEX application_spatial_unit_spatial_unit_id_fk131_ind ON application_spatial_unit USING btree (spatial_unit_id);
 
 
 --
--- Name: application_status_code_fk18_ind; Type: INDEX; Schema: application; Owner: postgres; Tablespace: 
+-- Name: application_status_code_fk18_ind; Type: INDEX; Schema: application; Owner: postgres
 --
 
 CREATE INDEX application_status_code_fk18_ind ON application USING btree (status_code);
 
 
 --
--- Name: application_uses_source_application_id_fk126_ind; Type: INDEX; Schema: application; Owner: postgres; Tablespace: 
+-- Name: application_uses_source_application_id_fk126_ind; Type: INDEX; Schema: application; Owner: postgres
 --
 
 CREATE INDEX application_uses_source_application_id_fk126_ind ON application_uses_source USING btree (application_id);
 
 
 --
--- Name: application_uses_source_historic_index_on_rowidentifier; Type: INDEX; Schema: application; Owner: postgres; Tablespace: 
+-- Name: application_uses_source_historic_index_on_rowidentifier; Type: INDEX; Schema: application; Owner: postgres
 --
 
 CREATE INDEX application_uses_source_historic_index_on_rowidentifier ON application_uses_source_historic USING btree (rowidentifier);
 
 
 --
--- Name: application_uses_source_index_on_rowidentifier; Type: INDEX; Schema: application; Owner: postgres; Tablespace: 
+-- Name: application_uses_source_index_on_rowidentifier; Type: INDEX; Schema: application; Owner: postgres
 --
 
 CREATE INDEX application_uses_source_index_on_rowidentifier ON application_uses_source USING btree (rowidentifier);
 
 
 --
--- Name: application_uses_source_source_id_fk127_ind; Type: INDEX; Schema: application; Owner: postgres; Tablespace: 
+-- Name: application_uses_source_source_id_fk127_ind; Type: INDEX; Schema: application; Owner: postgres
 --
 
 CREATE INDEX application_uses_source_source_id_fk127_ind ON application_uses_source USING btree (source_id);
 
 
 --
--- Name: request_type_config_panel_launcher_fkey_ind; Type: INDEX; Schema: application; Owner: postgres; Tablespace: 
+-- Name: notify_historic_index_on_rowidentifier; Type: INDEX; Schema: application; Owner: postgres
+--
+
+CREATE INDEX notify_historic_index_on_rowidentifier ON notify_historic USING btree (rowidentifier);
+
+
+--
+-- Name: notify_index_on_party_id; Type: INDEX; Schema: application; Owner: postgres
+--
+
+CREATE INDEX notify_index_on_party_id ON notify USING btree (party_id);
+
+
+--
+-- Name: notify_index_on_rowidentifier; Type: INDEX; Schema: application; Owner: postgres
+--
+
+CREATE INDEX notify_index_on_rowidentifier ON notify USING btree (rowidentifier);
+
+
+--
+-- Name: notify_index_on_service_id; Type: INDEX; Schema: application; Owner: postgres
+--
+
+CREATE INDEX notify_index_on_service_id ON notify USING btree (service_id);
+
+
+--
+-- Name: notify_property_ba_unit_id_fk_ind; Type: INDEX; Schema: application; Owner: postgres
+--
+
+CREATE INDEX notify_property_ba_unit_id_fk_ind ON notify_property USING btree (ba_unit_id);
+
+
+--
+-- Name: notify_property_historic_index_on_rowidentifier; Type: INDEX; Schema: application; Owner: postgres
+--
+
+CREATE INDEX notify_property_historic_index_on_rowidentifier ON notify_property_historic USING btree (rowidentifier);
+
+
+--
+-- Name: notify_property_index_on_rowidentifier; Type: INDEX; Schema: application; Owner: postgres
+--
+
+CREATE INDEX notify_property_index_on_rowidentifier ON notify_property USING btree (rowidentifier);
+
+
+--
+-- Name: notify_property_notify_id_fk_ind; Type: INDEX; Schema: application; Owner: postgres
+--
+
+CREATE INDEX notify_property_notify_id_fk_ind ON notify_property USING btree (notify_id);
+
+
+--
+-- Name: notify_uses_source_historic_index_on_rowidentifier; Type: INDEX; Schema: application; Owner: postgres
+--
+
+CREATE INDEX notify_uses_source_historic_index_on_rowidentifier ON notify_uses_source_historic USING btree (rowidentifier);
+
+
+--
+-- Name: notify_uses_source_index_on_rowidentifier; Type: INDEX; Schema: application; Owner: postgres
+--
+
+CREATE INDEX notify_uses_source_index_on_rowidentifier ON notify_uses_source USING btree (rowidentifier);
+
+
+--
+-- Name: notify_uses_source_notify_id_fk_ind; Type: INDEX; Schema: application; Owner: postgres
+--
+
+CREATE INDEX notify_uses_source_notify_id_fk_ind ON notify_uses_source USING btree (notify_id);
+
+
+--
+-- Name: notify_uses_source_source_id_fk_ind; Type: INDEX; Schema: application; Owner: postgres
+--
+
+CREATE INDEX notify_uses_source_source_id_fk_ind ON notify_uses_source USING btree (source_id);
+
+
+--
+-- Name: request_type_config_panel_launcher_fkey_ind; Type: INDEX; Schema: application; Owner: postgres
 --
 
 CREATE INDEX request_type_config_panel_launcher_fkey_ind ON request_type USING btree (service_panel_code);
 
 
 --
--- Name: request_type_request_category_code_fk20_ind; Type: INDEX; Schema: application; Owner: postgres; Tablespace: 
+-- Name: request_type_request_category_code_fk20_ind; Type: INDEX; Schema: application; Owner: postgres
 --
 
 CREATE INDEX request_type_request_category_code_fk20_ind ON request_type USING btree (request_category_code);
 
 
 --
--- Name: request_type_requires_source_type_request_type_code_fk129_ind; Type: INDEX; Schema: application; Owner: postgres; Tablespace: 
+-- Name: request_type_requires_source_type_request_type_code_fk129_ind; Type: INDEX; Schema: application; Owner: postgres
 --
 
 CREATE INDEX request_type_requires_source_type_request_type_code_fk129_ind ON request_type_requires_source_type USING btree (request_type_code);
 
 
 --
--- Name: request_type_requires_source_type_source_type_code_fk128_ind; Type: INDEX; Schema: application; Owner: postgres; Tablespace: 
+-- Name: request_type_requires_source_type_source_type_code_fk128_ind; Type: INDEX; Schema: application; Owner: postgres
 --
 
 CREATE INDEX request_type_requires_source_type_source_type_code_fk128_ind ON request_type_requires_source_type USING btree (source_type_code);
 
 
 --
--- Name: request_type_rrr_type_code_fk21_ind; Type: INDEX; Schema: application; Owner: postgres; Tablespace: 
+-- Name: request_type_rrr_type_code_fk21_ind; Type: INDEX; Schema: application; Owner: postgres
 --
 
 CREATE INDEX request_type_rrr_type_code_fk21_ind ON request_type USING btree (rrr_type_code);
 
 
 --
--- Name: request_type_type_action_code_fk23_ind; Type: INDEX; Schema: application; Owner: postgres; Tablespace: 
+-- Name: request_type_type_action_code_fk23_ind; Type: INDEX; Schema: application; Owner: postgres
 --
 
 CREATE INDEX request_type_type_action_code_fk23_ind ON request_type USING btree (type_action_code);
 
 
 --
--- Name: service_action_code_fk25_ind; Type: INDEX; Schema: application; Owner: postgres; Tablespace: 
+-- Name: service_action_code_fk25_ind; Type: INDEX; Schema: application; Owner: postgres
 --
 
 CREATE INDEX service_action_code_fk25_ind ON service USING btree (action_code);
 
 
 --
--- Name: service_action_type_status_to_set_fk26_ind; Type: INDEX; Schema: application; Owner: postgres; Tablespace: 
+-- Name: service_action_type_status_to_set_fk26_ind; Type: INDEX; Schema: application; Owner: postgres
 --
 
 CREATE INDEX service_action_type_status_to_set_fk26_ind ON service_action_type USING btree (status_to_set);
 
 
 --
--- Name: service_application_historic_ind; Type: INDEX; Schema: application; Owner: postgres; Tablespace: 
+-- Name: service_application_historic_ind; Type: INDEX; Schema: application; Owner: postgres
 --
 
 CREATE INDEX service_application_historic_ind ON service_historic USING btree (application_id);
 
 
 --
--- Name: service_application_id_fk7_ind; Type: INDEX; Schema: application; Owner: postgres; Tablespace: 
+-- Name: service_application_id_fk7_ind; Type: INDEX; Schema: application; Owner: postgres
 --
 
 CREATE INDEX service_application_id_fk7_ind ON service USING btree (application_id);
 
 
 --
--- Name: service_historic_id_idx; Type: INDEX; Schema: application; Owner: postgres; Tablespace: 
+-- Name: service_historic_id_idx; Type: INDEX; Schema: application; Owner: postgres
 --
 
 CREATE INDEX service_historic_id_idx ON service_historic USING btree (id);
 
 
 --
--- Name: service_historic_index_on_rowidentifier; Type: INDEX; Schema: application; Owner: postgres; Tablespace: 
+-- Name: service_historic_index_on_rowidentifier; Type: INDEX; Schema: application; Owner: postgres
 --
 
 CREATE INDEX service_historic_index_on_rowidentifier ON service_historic USING btree (rowidentifier);
 
 
 --
--- Name: service_index_on_rowidentifier; Type: INDEX; Schema: application; Owner: postgres; Tablespace: 
+-- Name: service_index_on_rowidentifier; Type: INDEX; Schema: application; Owner: postgres
 --
 
 CREATE INDEX service_index_on_rowidentifier ON service USING btree (rowidentifier);
 
 
 --
--- Name: service_request_type_code_fk19_ind; Type: INDEX; Schema: application; Owner: postgres; Tablespace: 
+-- Name: service_request_type_code_fk19_ind; Type: INDEX; Schema: application; Owner: postgres
 --
 
 CREATE INDEX service_request_type_code_fk19_ind ON service USING btree (request_type_code);
 
 
 --
--- Name: service_status_code_fk24_ind; Type: INDEX; Schema: application; Owner: postgres; Tablespace: 
+-- Name: service_status_code_fk24_ind; Type: INDEX; Schema: application; Owner: postgres
 --
 
 CREATE INDEX service_status_code_fk24_ind ON service USING btree (status_code);
 
 
-SET search_path = bulk_operation, pg_catalog;
-
---
--- Name: spatial_unit_temporary_cadastre_object_type_code_fk133_ind; Type: INDEX; Schema: bulk_operation; Owner: postgres; Tablespace: 
---
-
-CREATE INDEX spatial_unit_temporary_cadastre_object_type_code_fk133_ind ON spatial_unit_temporary USING btree (cadastre_object_type_code);
-
-
---
--- Name: spatial_unit_temporary_index_on_geom; Type: INDEX; Schema: bulk_operation; Owner: postgres; Tablespace: 
---
-
-CREATE INDEX spatial_unit_temporary_index_on_geom ON spatial_unit_temporary USING gist (geom);
-
-
---
--- Name: spatial_unit_temporary_index_on_rowidentifier; Type: INDEX; Schema: bulk_operation; Owner: postgres; Tablespace: 
---
-
-CREATE INDEX spatial_unit_temporary_index_on_rowidentifier ON spatial_unit_temporary USING btree (rowidentifier);
-
-
---
--- Name: spatial_unit_temporary_transaction_id_fk132_ind; Type: INDEX; Schema: bulk_operation; Owner: postgres; Tablespace: 
---
-
-CREATE INDEX spatial_unit_temporary_transaction_id_fk132_ind ON spatial_unit_temporary USING btree (transaction_id);
-
-
-
-
 SET search_path = cadastre, pg_catalog;
 
 --
--- Name: cadastre_object_building_unit_type_code_fk64_ind; Type: INDEX; Schema: cadastre; Owner: postgres; Tablespace: 
+-- Name: cadastre_object_building_unit_type_code_fk64_ind; Type: INDEX; Schema: cadastre; Owner: postgres
 --
 
 CREATE INDEX cadastre_object_building_unit_type_code_fk64_ind ON cadastre_object USING btree (building_unit_type_code);
 
 
 --
--- Name: cadastre_object_historic_index_on_geom_polygon; Type: INDEX; Schema: cadastre; Owner: postgres; Tablespace: 
+-- Name: cadastre_object_historic_index_on_geom_polygon; Type: INDEX; Schema: cadastre; Owner: postgres
 --
 
 CREATE INDEX cadastre_object_historic_index_on_geom_polygon ON cadastre_object_historic USING gist (geom_polygon);
 
 
 --
--- Name: cadastre_object_historic_index_on_rowidentifier; Type: INDEX; Schema: cadastre; Owner: postgres; Tablespace: 
+-- Name: cadastre_object_historic_index_on_rowidentifier; Type: INDEX; Schema: cadastre; Owner: postgres
 --
 
 CREATE INDEX cadastre_object_historic_index_on_rowidentifier ON cadastre_object_historic USING btree (rowidentifier);
 
 
 --
--- Name: cadastre_object_id_fk61_ind; Type: INDEX; Schema: cadastre; Owner: postgres; Tablespace: 
+-- Name: cadastre_object_id_fk61_ind; Type: INDEX; Schema: cadastre; Owner: postgres
 --
 
 CREATE INDEX cadastre_object_id_fk61_ind ON cadastre_object USING btree (id);
 
 
 --
--- Name: cadastre_object_index_on_geom_polygon; Type: INDEX; Schema: cadastre; Owner: postgres; Tablespace: 
+-- Name: cadastre_object_index_on_geom_polygon; Type: INDEX; Schema: cadastre; Owner: postgres
 --
 
 CREATE INDEX cadastre_object_index_on_geom_polygon ON cadastre_object USING gist (geom_polygon);
 
 
 --
--- Name: cadastre_object_index_on_rowidentifier; Type: INDEX; Schema: cadastre; Owner: postgres; Tablespace: 
+-- Name: cadastre_object_index_on_rowidentifier; Type: INDEX; Schema: cadastre; Owner: postgres
 --
 
 CREATE INDEX cadastre_object_index_on_rowidentifier ON cadastre_object USING btree (rowidentifier);
 
 
 --
--- Name: cadastre_object_node_target_historic_index_on_geom; Type: INDEX; Schema: cadastre; Owner: postgres; Tablespace: 
+-- Name: cadastre_object_node_target_historic_index_on_geom; Type: INDEX; Schema: cadastre; Owner: postgres
 --
 
 CREATE INDEX cadastre_object_node_target_historic_index_on_geom ON cadastre_object_node_target_historic USING gist (geom);
 
 
 --
--- Name: cadastre_object_node_target_historic_index_on_rowidentifier; Type: INDEX; Schema: cadastre; Owner: postgres; Tablespace: 
+-- Name: cadastre_object_node_target_historic_index_on_rowidentifier; Type: INDEX; Schema: cadastre; Owner: postgres
 --
 
 CREATE INDEX cadastre_object_node_target_historic_index_on_rowidentifier ON cadastre_object_node_target_historic USING btree (rowidentifier);
 
 
 --
--- Name: cadastre_object_node_target_index_on_geom; Type: INDEX; Schema: cadastre; Owner: postgres; Tablespace: 
+-- Name: cadastre_object_node_target_index_on_geom; Type: INDEX; Schema: cadastre; Owner: postgres
 --
 
 CREATE INDEX cadastre_object_node_target_index_on_geom ON cadastre_object_node_target USING gist (geom);
 
 
 --
--- Name: cadastre_object_node_target_index_on_rowidentifier; Type: INDEX; Schema: cadastre; Owner: postgres; Tablespace: 
+-- Name: cadastre_object_node_target_index_on_rowidentifier; Type: INDEX; Schema: cadastre; Owner: postgres
 --
 
 CREATE INDEX cadastre_object_node_target_index_on_rowidentifier ON cadastre_object_node_target USING btree (rowidentifier);
 
 
 --
--- Name: cadastre_object_node_target_transaction_id_fk102_ind; Type: INDEX; Schema: cadastre; Owner: postgres; Tablespace: 
+-- Name: cadastre_object_node_target_transaction_id_fk102_ind; Type: INDEX; Schema: cadastre; Owner: postgres
 --
 
 CREATE INDEX cadastre_object_node_target_transaction_id_fk102_ind ON cadastre_object_node_target USING btree (transaction_id);
 
 
 --
--- Name: cadastre_object_status_code_fk63_ind; Type: INDEX; Schema: cadastre; Owner: postgres; Tablespace: 
+-- Name: cadastre_object_status_code_fk63_ind; Type: INDEX; Schema: cadastre; Owner: postgres
 --
 
 CREATE INDEX cadastre_object_status_code_fk63_ind ON cadastre_object USING btree (status_code);
 
 
 --
--- Name: cadastre_object_target_cadastre_object_id_fk97_ind; Type: INDEX; Schema: cadastre; Owner: postgres; Tablespace: 
+-- Name: cadastre_object_target_cadastre_object_id_fk97_ind; Type: INDEX; Schema: cadastre; Owner: postgres
 --
 
 CREATE INDEX cadastre_object_target_cadastre_object_id_fk97_ind ON cadastre_object_target USING btree (cadastre_object_id);
 
 
 --
--- Name: cadastre_object_target_historic_index_on_geom_polygon; Type: INDEX; Schema: cadastre; Owner: postgres; Tablespace: 
+-- Name: cadastre_object_target_historic_index_on_geom_polygon; Type: INDEX; Schema: cadastre; Owner: postgres
 --
 
 CREATE INDEX cadastre_object_target_historic_index_on_geom_polygon ON cadastre_object_target_historic USING gist (geom_polygon);
 
 
 --
--- Name: cadastre_object_target_historic_index_on_rowidentifier; Type: INDEX; Schema: cadastre; Owner: postgres; Tablespace: 
+-- Name: cadastre_object_target_historic_index_on_rowidentifier; Type: INDEX; Schema: cadastre; Owner: postgres
 --
 
 CREATE INDEX cadastre_object_target_historic_index_on_rowidentifier ON cadastre_object_target_historic USING btree (rowidentifier);
 
 
 --
--- Name: cadastre_object_target_index_on_geom_polygon; Type: INDEX; Schema: cadastre; Owner: postgres; Tablespace: 
+-- Name: cadastre_object_target_index_on_geom_polygon; Type: INDEX; Schema: cadastre; Owner: postgres
 --
 
 CREATE INDEX cadastre_object_target_index_on_geom_polygon ON cadastre_object_target USING gist (geom_polygon);
 
 
 --
--- Name: cadastre_object_target_index_on_rowidentifier; Type: INDEX; Schema: cadastre; Owner: postgres; Tablespace: 
+-- Name: cadastre_object_target_index_on_rowidentifier; Type: INDEX; Schema: cadastre; Owner: postgres
 --
 
 CREATE INDEX cadastre_object_target_index_on_rowidentifier ON cadastre_object_target USING btree (rowidentifier);
 
 
 --
--- Name: cadastre_object_target_transaction_id_fk98_ind; Type: INDEX; Schema: cadastre; Owner: postgres; Tablespace: 
+-- Name: cadastre_object_target_transaction_id_fk98_ind; Type: INDEX; Schema: cadastre; Owner: postgres
 --
 
 CREATE INDEX cadastre_object_target_transaction_id_fk98_ind ON cadastre_object_target USING btree (transaction_id);
 
 
 --
--- Name: cadastre_object_transaction_id_fk65_ind; Type: INDEX; Schema: cadastre; Owner: postgres; Tablespace: 
+-- Name: cadastre_object_transaction_id_fk65_ind; Type: INDEX; Schema: cadastre; Owner: postgres
 --
 
 CREATE INDEX cadastre_object_transaction_id_fk65_ind ON cadastre_object USING btree (transaction_id);
 
 
 --
--- Name: cadastre_object_type_code_fk62_ind; Type: INDEX; Schema: cadastre; Owner: postgres; Tablespace: 
+-- Name: cadastre_object_type_code_fk62_ind; Type: INDEX; Schema: cadastre; Owner: postgres
 --
 
 CREATE INDEX cadastre_object_type_code_fk62_ind ON cadastre_object USING btree (type_code);
 
 
 --
--- Name: legal_space_utility_network_historic_index_on_geom; Type: INDEX; Schema: cadastre; Owner: postgres; Tablespace: 
+-- Name: legal_space_utility_network_historic_index_on_geom; Type: INDEX; Schema: cadastre; Owner: postgres
 --
 
 CREATE INDEX legal_space_utility_network_historic_index_on_geom ON legal_space_utility_network_historic USING gist (geom);
 
 
 --
--- Name: legal_space_utility_network_historic_index_on_rowidentifier; Type: INDEX; Schema: cadastre; Owner: postgres; Tablespace: 
+-- Name: legal_space_utility_network_historic_index_on_rowidentifier; Type: INDEX; Schema: cadastre; Owner: postgres
 --
 
 CREATE INDEX legal_space_utility_network_historic_index_on_rowidentifier ON legal_space_utility_network_historic USING btree (rowidentifier);
 
 
 --
--- Name: legal_space_utility_network_id_fk94_ind; Type: INDEX; Schema: cadastre; Owner: postgres; Tablespace: 
+-- Name: legal_space_utility_network_id_fk94_ind; Type: INDEX; Schema: cadastre; Owner: postgres
 --
 
 CREATE INDEX legal_space_utility_network_id_fk94_ind ON legal_space_utility_network USING btree (id);
 
 
 --
--- Name: legal_space_utility_network_index_on_geom; Type: INDEX; Schema: cadastre; Owner: postgres; Tablespace: 
+-- Name: legal_space_utility_network_index_on_geom; Type: INDEX; Schema: cadastre; Owner: postgres
 --
 
 CREATE INDEX legal_space_utility_network_index_on_geom ON legal_space_utility_network USING gist (geom);
 
 
 --
--- Name: legal_space_utility_network_index_on_rowidentifier; Type: INDEX; Schema: cadastre; Owner: postgres; Tablespace: 
+-- Name: legal_space_utility_network_index_on_rowidentifier; Type: INDEX; Schema: cadastre; Owner: postgres
 --
 
 CREATE INDEX legal_space_utility_network_index_on_rowidentifier ON legal_space_utility_network USING btree (rowidentifier);
 
 
 --
--- Name: legal_space_utility_network_status_code_fk95_ind; Type: INDEX; Schema: cadastre; Owner: postgres; Tablespace: 
+-- Name: legal_space_utility_network_status_code_fk95_ind; Type: INDEX; Schema: cadastre; Owner: postgres
 --
 
 CREATE INDEX legal_space_utility_network_status_code_fk95_ind ON legal_space_utility_network USING btree (status_code);
 
 
 --
--- Name: legal_space_utility_network_type_code_fk96_ind; Type: INDEX; Schema: cadastre; Owner: postgres; Tablespace: 
+-- Name: legal_space_utility_network_type_code_fk96_ind; Type: INDEX; Schema: cadastre; Owner: postgres
 --
 
 CREATE INDEX legal_space_utility_network_type_code_fk96_ind ON legal_space_utility_network USING btree (type_code);
 
 
 --
--- Name: level_historic_index_on_rowidentifier; Type: INDEX; Schema: cadastre; Owner: postgres; Tablespace: 
+-- Name: level_historic_index_on_rowidentifier; Type: INDEX; Schema: cadastre; Owner: postgres
 --
 
 CREATE INDEX level_historic_index_on_rowidentifier ON level_historic USING btree (rowidentifier);
 
 
 --
--- Name: level_index_on_rowidentifier; Type: INDEX; Schema: cadastre; Owner: postgres; Tablespace: 
+-- Name: level_index_on_rowidentifier; Type: INDEX; Schema: cadastre; Owner: postgres
 --
 
 CREATE INDEX level_index_on_rowidentifier ON level USING btree (rowidentifier);
 
 
 --
--- Name: level_register_type_code_fk58_ind; Type: INDEX; Schema: cadastre; Owner: postgres; Tablespace: 
+-- Name: level_register_type_code_fk58_ind; Type: INDEX; Schema: cadastre; Owner: postgres
 --
 
 CREATE INDEX level_register_type_code_fk58_ind ON level USING btree (register_type_code);
 
 
 --
--- Name: level_structure_code_fk59_ind; Type: INDEX; Schema: cadastre; Owner: postgres; Tablespace: 
+-- Name: level_structure_code_fk59_ind; Type: INDEX; Schema: cadastre; Owner: postgres
 --
 
 CREATE INDEX level_structure_code_fk59_ind ON level USING btree (structure_code);
 
 
 --
--- Name: level_type_code_fk60_ind; Type: INDEX; Schema: cadastre; Owner: postgres; Tablespace: 
+-- Name: level_type_code_fk60_ind; Type: INDEX; Schema: cadastre; Owner: postgres
 --
 
 CREATE INDEX level_type_code_fk60_ind ON level USING btree (type_code);
 
 
 --
--- Name: spatial_unit_address_address_id_fk90_ind; Type: INDEX; Schema: cadastre; Owner: postgres; Tablespace: 
+-- Name: spatial_unit_address_address_id_fk90_ind; Type: INDEX; Schema: cadastre; Owner: postgres
 --
 
 CREATE INDEX spatial_unit_address_address_id_fk90_ind ON spatial_unit_address USING btree (address_id);
 
 
 --
--- Name: spatial_unit_address_historic_index_on_rowidentifier; Type: INDEX; Schema: cadastre; Owner: postgres; Tablespace: 
+-- Name: spatial_unit_address_historic_index_on_rowidentifier; Type: INDEX; Schema: cadastre; Owner: postgres
 --
 
 CREATE INDEX spatial_unit_address_historic_index_on_rowidentifier ON spatial_unit_address_historic USING btree (rowidentifier);
 
 
 --
--- Name: spatial_unit_address_index_on_rowidentifier; Type: INDEX; Schema: cadastre; Owner: postgres; Tablespace: 
+-- Name: spatial_unit_address_index_on_rowidentifier; Type: INDEX; Schema: cadastre; Owner: postgres
 --
 
 CREATE INDEX spatial_unit_address_index_on_rowidentifier ON spatial_unit_address USING btree (rowidentifier);
 
 
 --
--- Name: spatial_unit_address_spatial_unit_id_fk89_ind; Type: INDEX; Schema: cadastre; Owner: postgres; Tablespace: 
+-- Name: spatial_unit_address_spatial_unit_id_fk89_ind; Type: INDEX; Schema: cadastre; Owner: postgres
 --
 
 CREATE INDEX spatial_unit_address_spatial_unit_id_fk89_ind ON spatial_unit_address USING btree (spatial_unit_id);
 
 
 --
--- Name: spatial_unit_dimension_code_fk55_ind; Type: INDEX; Schema: cadastre; Owner: postgres; Tablespace: 
+-- Name: spatial_unit_dimension_code_fk55_ind; Type: INDEX; Schema: cadastre; Owner: postgres
 --
 
 CREATE INDEX spatial_unit_dimension_code_fk55_ind ON spatial_unit USING btree (dimension_code);
 
 
 --
--- Name: spatial_unit_group_found_in_spatial_unit_group_id_fk91_ind; Type: INDEX; Schema: cadastre; Owner: postgres; Tablespace: 
+-- Name: spatial_unit_group_found_in_spatial_unit_group_id_fk91_ind; Type: INDEX; Schema: cadastre; Owner: postgres
 --
 
 CREATE INDEX spatial_unit_group_found_in_spatial_unit_group_id_fk91_ind ON spatial_unit_group USING btree (found_in_spatial_unit_group_id);
 
 
 --
--- Name: spatial_unit_group_historic_index_on_geom; Type: INDEX; Schema: cadastre; Owner: postgres; Tablespace: 
+-- Name: spatial_unit_group_historic_index_on_geom; Type: INDEX; Schema: cadastre; Owner: postgres
 --
 
 CREATE INDEX spatial_unit_group_historic_index_on_geom ON spatial_unit_group_historic USING gist (geom);
 
 
 --
--- Name: spatial_unit_group_historic_index_on_reference_point; Type: INDEX; Schema: cadastre; Owner: postgres; Tablespace: 
+-- Name: spatial_unit_group_historic_index_on_reference_point; Type: INDEX; Schema: cadastre; Owner: postgres
 --
 
 CREATE INDEX spatial_unit_group_historic_index_on_reference_point ON spatial_unit_group_historic USING gist (reference_point);
 
 
 --
--- Name: spatial_unit_group_historic_index_on_rowidentifier; Type: INDEX; Schema: cadastre; Owner: postgres; Tablespace: 
+-- Name: spatial_unit_group_historic_index_on_rowidentifier; Type: INDEX; Schema: cadastre; Owner: postgres
 --
 
 CREATE INDEX spatial_unit_group_historic_index_on_rowidentifier ON spatial_unit_group_historic USING btree (rowidentifier);
 
 
 --
--- Name: spatial_unit_group_index_on_geom; Type: INDEX; Schema: cadastre; Owner: postgres; Tablespace: 
+-- Name: spatial_unit_group_index_on_geom; Type: INDEX; Schema: cadastre; Owner: postgres
 --
 
 CREATE INDEX spatial_unit_group_index_on_geom ON spatial_unit_group USING gist (geom);
 
 
 --
--- Name: spatial_unit_group_index_on_reference_point; Type: INDEX; Schema: cadastre; Owner: postgres; Tablespace: 
+-- Name: spatial_unit_group_index_on_reference_point; Type: INDEX; Schema: cadastre; Owner: postgres
 --
 
 CREATE INDEX spatial_unit_group_index_on_reference_point ON spatial_unit_group USING gist (reference_point);
 
 
 --
--- Name: spatial_unit_group_index_on_rowidentifier; Type: INDEX; Schema: cadastre; Owner: postgres; Tablespace: 
+-- Name: spatial_unit_group_index_on_rowidentifier; Type: INDEX; Schema: cadastre; Owner: postgres
 --
 
 CREATE INDEX spatial_unit_group_index_on_rowidentifier ON spatial_unit_group USING btree (rowidentifier);
 
 
 --
--- Name: spatial_unit_historic_index_on_geom; Type: INDEX; Schema: cadastre; Owner: postgres; Tablespace: 
+-- Name: spatial_unit_historic_index_on_geom; Type: INDEX; Schema: cadastre; Owner: postgres
 --
 
 CREATE INDEX spatial_unit_historic_index_on_geom ON spatial_unit_historic USING gist (geom);
 
 
 --
--- Name: spatial_unit_historic_index_on_reference_point; Type: INDEX; Schema: cadastre; Owner: postgres; Tablespace: 
+-- Name: spatial_unit_historic_index_on_reference_point; Type: INDEX; Schema: cadastre; Owner: postgres
 --
 
 CREATE INDEX spatial_unit_historic_index_on_reference_point ON spatial_unit_historic USING gist (reference_point);
 
 
 --
--- Name: spatial_unit_historic_index_on_rowidentifier; Type: INDEX; Schema: cadastre; Owner: postgres; Tablespace: 
+-- Name: spatial_unit_historic_index_on_rowidentifier; Type: INDEX; Schema: cadastre; Owner: postgres
 --
 
 CREATE INDEX spatial_unit_historic_index_on_rowidentifier ON spatial_unit_historic USING btree (rowidentifier);
 
 
 --
--- Name: spatial_unit_in_group_historic_index_on_rowidentifier; Type: INDEX; Schema: cadastre; Owner: postgres; Tablespace: 
+-- Name: spatial_unit_in_group_historic_index_on_rowidentifier; Type: INDEX; Schema: cadastre; Owner: postgres
 --
 
 CREATE INDEX spatial_unit_in_group_historic_index_on_rowidentifier ON spatial_unit_in_group_historic USING btree (rowidentifier);
 
 
 --
--- Name: spatial_unit_in_group_index_on_rowidentifier; Type: INDEX; Schema: cadastre; Owner: postgres; Tablespace: 
+-- Name: spatial_unit_in_group_index_on_rowidentifier; Type: INDEX; Schema: cadastre; Owner: postgres
 --
 
 CREATE INDEX spatial_unit_in_group_index_on_rowidentifier ON spatial_unit_in_group USING btree (rowidentifier);
 
 
 --
--- Name: spatial_unit_in_group_spatial_unit_group_id_fk92_ind; Type: INDEX; Schema: cadastre; Owner: postgres; Tablespace: 
+-- Name: spatial_unit_in_group_spatial_unit_group_id_fk92_ind; Type: INDEX; Schema: cadastre; Owner: postgres
 --
 
 CREATE INDEX spatial_unit_in_group_spatial_unit_group_id_fk92_ind ON spatial_unit_in_group USING btree (spatial_unit_group_id);
 
 
 --
--- Name: spatial_unit_in_group_spatial_unit_id_fk93_ind; Type: INDEX; Schema: cadastre; Owner: postgres; Tablespace: 
+-- Name: spatial_unit_in_group_spatial_unit_id_fk93_ind; Type: INDEX; Schema: cadastre; Owner: postgres
 --
 
 CREATE INDEX spatial_unit_in_group_spatial_unit_id_fk93_ind ON spatial_unit_in_group USING btree (spatial_unit_id);
 
 
 --
--- Name: spatial_unit_index_on_geom; Type: INDEX; Schema: cadastre; Owner: postgres; Tablespace: 
+-- Name: spatial_unit_index_on_geom; Type: INDEX; Schema: cadastre; Owner: postgres
 --
 
 CREATE INDEX spatial_unit_index_on_geom ON spatial_unit USING gist (geom);
 
 
 --
--- Name: spatial_unit_index_on_reference_point; Type: INDEX; Schema: cadastre; Owner: postgres; Tablespace: 
+-- Name: spatial_unit_index_on_reference_point; Type: INDEX; Schema: cadastre; Owner: postgres
 --
 
 CREATE INDEX spatial_unit_index_on_reference_point ON spatial_unit USING gist (reference_point);
 
 
 --
--- Name: spatial_unit_index_on_rowidentifier; Type: INDEX; Schema: cadastre; Owner: postgres; Tablespace: 
+-- Name: spatial_unit_index_on_rowidentifier; Type: INDEX; Schema: cadastre; Owner: postgres
 --
 
 CREATE INDEX spatial_unit_index_on_rowidentifier ON spatial_unit USING btree (rowidentifier);
 
 
 --
--- Name: spatial_unit_land_use_code_fk66_ind; Type: INDEX; Schema: cadastre; Owner: postgres; Tablespace: 
+-- Name: spatial_unit_land_use_code_fk66_ind; Type: INDEX; Schema: cadastre; Owner: postgres
 --
 
 CREATE INDEX spatial_unit_land_use_code_fk66_ind ON spatial_unit USING btree (land_use_code);
 
 
 --
--- Name: spatial_unit_level_id_fk57_ind; Type: INDEX; Schema: cadastre; Owner: postgres; Tablespace: 
+-- Name: spatial_unit_level_id_fk57_ind; Type: INDEX; Schema: cadastre; Owner: postgres
 --
 
 CREATE INDEX spatial_unit_level_id_fk57_ind ON spatial_unit USING btree (level_id);
 
 
 --
--- Name: spatial_unit_surface_relation_code_fk56_ind; Type: INDEX; Schema: cadastre; Owner: postgres; Tablespace: 
+-- Name: spatial_unit_surface_relation_code_fk56_ind; Type: INDEX; Schema: cadastre; Owner: postgres
 --
 
 CREATE INDEX spatial_unit_surface_relation_code_fk56_ind ON spatial_unit USING btree (surface_relation_code);
 
 
 --
--- Name: spatial_unit_transaction_id_fk67_ind; Type: INDEX; Schema: cadastre; Owner: postgres; Tablespace: 
+-- Name: spatial_unit_transaction_id_fk67_ind; Type: INDEX; Schema: cadastre; Owner: postgres
 --
 
 CREATE INDEX spatial_unit_transaction_id_fk67_ind ON spatial_unit USING btree (transaction_id);
 
 
 --
--- Name: spatial_value_area_historic_index_on_rowidentifier; Type: INDEX; Schema: cadastre; Owner: postgres; Tablespace: 
+-- Name: spatial_value_area_historic_index_on_rowidentifier; Type: INDEX; Schema: cadastre; Owner: postgres
 --
 
 CREATE INDEX spatial_value_area_historic_index_on_rowidentifier ON spatial_value_area_historic USING btree (rowidentifier);
 
 
 --
--- Name: spatial_value_area_index_on_rowidentifier; Type: INDEX; Schema: cadastre; Owner: postgres; Tablespace: 
+-- Name: spatial_value_area_index_on_rowidentifier; Type: INDEX; Schema: cadastre; Owner: postgres
 --
 
 CREATE INDEX spatial_value_area_index_on_rowidentifier ON spatial_value_area USING btree (rowidentifier);
 
 
 --
--- Name: spatial_value_area_spatial_unit_id_fk87_ind; Type: INDEX; Schema: cadastre; Owner: postgres; Tablespace: 
+-- Name: spatial_value_area_spatial_unit_id_fk87_ind; Type: INDEX; Schema: cadastre; Owner: postgres
 --
 
 CREATE INDEX spatial_value_area_spatial_unit_id_fk87_ind ON spatial_value_area USING btree (spatial_unit_id);
 
 
 --
--- Name: spatial_value_area_type_code_fk88_ind; Type: INDEX; Schema: cadastre; Owner: postgres; Tablespace: 
+-- Name: spatial_value_area_type_code_fk88_ind; Type: INDEX; Schema: cadastre; Owner: postgres
 --
 
 CREATE INDEX spatial_value_area_type_code_fk88_ind ON spatial_value_area USING btree (type_code);
 
 
 --
--- Name: survey_point_historic_index_on_geom; Type: INDEX; Schema: cadastre; Owner: postgres; Tablespace: 
+-- Name: survey_point_historic_index_on_geom; Type: INDEX; Schema: cadastre; Owner: postgres
 --
 
 CREATE INDEX survey_point_historic_index_on_geom ON survey_point_historic USING gist (geom);
 
 
 --
--- Name: survey_point_historic_index_on_original_geom; Type: INDEX; Schema: cadastre; Owner: postgres; Tablespace: 
+-- Name: survey_point_historic_index_on_original_geom; Type: INDEX; Schema: cadastre; Owner: postgres
 --
 
 CREATE INDEX survey_point_historic_index_on_original_geom ON survey_point_historic USING gist (original_geom);
 
 
 --
--- Name: survey_point_historic_index_on_rowidentifier; Type: INDEX; Schema: cadastre; Owner: postgres; Tablespace: 
+-- Name: survey_point_historic_index_on_rowidentifier; Type: INDEX; Schema: cadastre; Owner: postgres
 --
 
 CREATE INDEX survey_point_historic_index_on_rowidentifier ON survey_point_historic USING btree (rowidentifier);
 
 
 --
--- Name: survey_point_index_on_geom; Type: INDEX; Schema: cadastre; Owner: postgres; Tablespace: 
+-- Name: survey_point_index_on_geom; Type: INDEX; Schema: cadastre; Owner: postgres
 --
 
 CREATE INDEX survey_point_index_on_geom ON survey_point USING gist (geom);
 
 
 --
--- Name: survey_point_index_on_original_geom; Type: INDEX; Schema: cadastre; Owner: postgres; Tablespace: 
+-- Name: survey_point_index_on_original_geom; Type: INDEX; Schema: cadastre; Owner: postgres
 --
 
 CREATE INDEX survey_point_index_on_original_geom ON survey_point USING gist (original_geom);
 
 
 --
--- Name: survey_point_index_on_rowidentifier; Type: INDEX; Schema: cadastre; Owner: postgres; Tablespace: 
+-- Name: survey_point_index_on_rowidentifier; Type: INDEX; Schema: cadastre; Owner: postgres
 --
 
 CREATE INDEX survey_point_index_on_rowidentifier ON survey_point USING btree (rowidentifier);
 
 
 --
--- Name: survey_point_transaction_id_fk99_ind; Type: INDEX; Schema: cadastre; Owner: postgres; Tablespace: 
+-- Name: survey_point_transaction_id_fk99_ind; Type: INDEX; Schema: cadastre; Owner: postgres
 --
 
 CREATE INDEX survey_point_transaction_id_fk99_ind ON survey_point USING btree (transaction_id);
@@ -16931,14 +17327,14 @@ CREATE INDEX survey_point_transaction_id_fk99_ind ON survey_point USING btree (t
 SET search_path = document, pg_catalog;
 
 --
--- Name: document_historic_index_on_rowidentifier; Type: INDEX; Schema: document; Owner: postgres; Tablespace: 
+-- Name: document_historic_index_on_rowidentifier; Type: INDEX; Schema: document; Owner: postgres
 --
 
 CREATE INDEX document_historic_index_on_rowidentifier ON document_historic USING btree (rowidentifier);
 
 
 --
--- Name: document_index_on_rowidentifier; Type: INDEX; Schema: document; Owner: postgres; Tablespace: 
+-- Name: document_index_on_rowidentifier; Type: INDEX; Schema: document; Owner: postgres
 --
 
 CREATE INDEX document_index_on_rowidentifier ON document USING btree (rowidentifier);
@@ -16947,161 +17343,161 @@ CREATE INDEX document_index_on_rowidentifier ON document USING btree (rowidentif
 SET search_path = party, pg_catalog;
 
 --
--- Name: group_party_historic_index_on_rowidentifier; Type: INDEX; Schema: party; Owner: postgres; Tablespace: 
+-- Name: group_party_historic_index_on_rowidentifier; Type: INDEX; Schema: party; Owner: postgres
 --
 
 CREATE INDEX group_party_historic_index_on_rowidentifier ON group_party_historic USING btree (rowidentifier);
 
 
 --
--- Name: group_party_id_fk32_ind; Type: INDEX; Schema: party; Owner: postgres; Tablespace: 
+-- Name: group_party_id_fk32_ind; Type: INDEX; Schema: party; Owner: postgres
 --
 
 CREATE INDEX group_party_id_fk32_ind ON group_party USING btree (id);
 
 
 --
--- Name: group_party_index_on_rowidentifier; Type: INDEX; Schema: party; Owner: postgres; Tablespace: 
+-- Name: group_party_index_on_rowidentifier; Type: INDEX; Schema: party; Owner: postgres
 --
 
 CREATE INDEX group_party_index_on_rowidentifier ON group_party USING btree (rowidentifier);
 
 
 --
--- Name: group_party_type_code_fk33_ind; Type: INDEX; Schema: party; Owner: postgres; Tablespace: 
+-- Name: group_party_type_code_fk33_ind; Type: INDEX; Schema: party; Owner: postgres
 --
 
 CREATE INDEX group_party_type_code_fk33_ind ON group_party USING btree (type_code);
 
 
 --
--- Name: party_address_id_fk10_ind; Type: INDEX; Schema: party; Owner: postgres; Tablespace: 
+-- Name: party_address_id_fk10_ind; Type: INDEX; Schema: party; Owner: postgres
 --
 
 CREATE INDEX party_address_id_fk10_ind ON party USING btree (address_id);
 
 
 --
--- Name: party_gender_code_fk13_ind; Type: INDEX; Schema: party; Owner: postgres; Tablespace: 
+-- Name: party_gender_code_fk13_ind; Type: INDEX; Schema: party; Owner: postgres
 --
 
 CREATE INDEX party_gender_code_fk13_ind ON party USING btree (gender_code);
 
 
 --
--- Name: party_historic_index_on_rowidentifier; Type: INDEX; Schema: party; Owner: postgres; Tablespace: 
+-- Name: party_historic_index_on_rowidentifier; Type: INDEX; Schema: party; Owner: postgres
 --
 
 CREATE INDEX party_historic_index_on_rowidentifier ON party_historic USING btree (rowidentifier);
 
 
 --
--- Name: party_id_type_code_fk12_ind; Type: INDEX; Schema: party; Owner: postgres; Tablespace: 
+-- Name: party_id_type_code_fk12_ind; Type: INDEX; Schema: party; Owner: postgres
 --
 
 CREATE INDEX party_id_type_code_fk12_ind ON party USING btree (id_type_code);
 
 
 --
--- Name: party_index_on_rowidentifier; Type: INDEX; Schema: party; Owner: postgres; Tablespace: 
+-- Name: party_index_on_rowidentifier; Type: INDEX; Schema: party; Owner: postgres
 --
 
 CREATE INDEX party_index_on_rowidentifier ON party USING btree (rowidentifier);
 
 
 --
--- Name: party_member_group_id_fk35_ind; Type: INDEX; Schema: party; Owner: postgres; Tablespace: 
+-- Name: party_member_group_id_fk35_ind; Type: INDEX; Schema: party; Owner: postgres
 --
 
 CREATE INDEX party_member_group_id_fk35_ind ON party_member USING btree (group_id);
 
 
 --
--- Name: party_member_historic_index_on_rowidentifier; Type: INDEX; Schema: party; Owner: postgres; Tablespace: 
+-- Name: party_member_historic_index_on_rowidentifier; Type: INDEX; Schema: party; Owner: postgres
 --
 
 CREATE INDEX party_member_historic_index_on_rowidentifier ON party_member_historic USING btree (rowidentifier);
 
 
 --
--- Name: party_member_index_on_rowidentifier; Type: INDEX; Schema: party; Owner: postgres; Tablespace: 
+-- Name: party_member_index_on_rowidentifier; Type: INDEX; Schema: party; Owner: postgres
 --
 
 CREATE INDEX party_member_index_on_rowidentifier ON party_member USING btree (rowidentifier);
 
 
 --
--- Name: party_member_party_id_fk34_ind; Type: INDEX; Schema: party; Owner: postgres; Tablespace: 
+-- Name: party_member_party_id_fk34_ind; Type: INDEX; Schema: party; Owner: postgres
 --
 
 CREATE INDEX party_member_party_id_fk34_ind ON party_member USING btree (party_id);
 
 
 --
--- Name: party_preferred_communication_code_fk11_ind; Type: INDEX; Schema: party; Owner: postgres; Tablespace: 
+-- Name: party_preferred_communication_code_fk11_ind; Type: INDEX; Schema: party; Owner: postgres
 --
 
 CREATE INDEX party_preferred_communication_code_fk11_ind ON party USING btree (preferred_communication_code);
 
 
 --
--- Name: party_role_historic_index_on_rowidentifier; Type: INDEX; Schema: party; Owner: postgres; Tablespace: 
+-- Name: party_role_historic_index_on_rowidentifier; Type: INDEX; Schema: party; Owner: postgres
 --
 
 CREATE INDEX party_role_historic_index_on_rowidentifier ON party_role_historic USING btree (rowidentifier);
 
 
 --
--- Name: party_role_index_on_rowidentifier; Type: INDEX; Schema: party; Owner: postgres; Tablespace: 
+-- Name: party_role_index_on_rowidentifier; Type: INDEX; Schema: party; Owner: postgres
 --
 
 CREATE INDEX party_role_index_on_rowidentifier ON party_role USING btree (rowidentifier);
 
 
 --
--- Name: party_role_party_id_fk36_ind; Type: INDEX; Schema: party; Owner: postgres; Tablespace: 
+-- Name: party_role_party_id_fk36_ind; Type: INDEX; Schema: party; Owner: postgres
 --
 
 CREATE INDEX party_role_party_id_fk36_ind ON party_role USING btree (party_id);
 
 
 --
--- Name: party_role_type_code_fk37_ind; Type: INDEX; Schema: party; Owner: postgres; Tablespace: 
+-- Name: party_role_type_code_fk37_ind; Type: INDEX; Schema: party; Owner: postgres
 --
 
 CREATE INDEX party_role_type_code_fk37_ind ON party_role USING btree (type_code);
 
 
 --
--- Name: party_type_code_fk9_ind; Type: INDEX; Schema: party; Owner: postgres; Tablespace: 
+-- Name: party_type_code_fk9_ind; Type: INDEX; Schema: party; Owner: postgres
 --
 
 CREATE INDEX party_type_code_fk9_ind ON party USING btree (type_code);
 
 
 --
--- Name: source_describes_party_historic_index_on_rowidentifier; Type: INDEX; Schema: party; Owner: postgres; Tablespace: 
+-- Name: source_describes_party_historic_index_on_rowidentifier; Type: INDEX; Schema: party; Owner: postgres
 --
 
 CREATE INDEX source_describes_party_historic_index_on_rowidentifier ON source_describes_party_historic USING btree (rowidentifier);
 
 
 --
--- Name: source_describes_party_index_on_rowidentifier; Type: INDEX; Schema: party; Owner: postgres; Tablespace: 
+-- Name: source_describes_party_index_on_rowidentifier; Type: INDEX; Schema: party; Owner: postgres
 --
 
 CREATE INDEX source_describes_party_index_on_rowidentifier ON source_describes_party USING btree (rowidentifier);
 
 
 --
--- Name: source_describes_party_party_id_fk41_ind; Type: INDEX; Schema: party; Owner: postgres; Tablespace: 
+-- Name: source_describes_party_party_id_fk41_ind; Type: INDEX; Schema: party; Owner: postgres
 --
 
 CREATE INDEX source_describes_party_party_id_fk41_ind ON source_describes_party USING btree (party_id);
 
 
 --
--- Name: source_describes_party_source_id_fk42_ind; Type: INDEX; Schema: party; Owner: postgres; Tablespace: 
+-- Name: source_describes_party_source_id_fk42_ind; Type: INDEX; Schema: party; Owner: postgres
 --
 
 CREATE INDEX source_describes_party_source_id_fk42_ind ON source_describes_party USING btree (source_id);
@@ -17110,140 +17506,140 @@ CREATE INDEX source_describes_party_source_id_fk42_ind ON source_describes_party
 SET search_path = source, pg_catalog;
 
 --
--- Name: archive_historic_index_on_rowidentifier; Type: INDEX; Schema: source; Owner: postgres; Tablespace: 
+-- Name: archive_historic_index_on_rowidentifier; Type: INDEX; Schema: source; Owner: postgres
 --
 
 CREATE INDEX archive_historic_index_on_rowidentifier ON archive_historic USING btree (rowidentifier);
 
 
 --
--- Name: archive_index_on_rowidentifier; Type: INDEX; Schema: source; Owner: postgres; Tablespace: 
+-- Name: archive_index_on_rowidentifier; Type: INDEX; Schema: source; Owner: postgres
 --
 
 CREATE INDEX archive_index_on_rowidentifier ON archive USING btree (rowidentifier);
 
 
 --
--- Name: power_of_attorney_historic_index_on_rowidentifier; Type: INDEX; Schema: source; Owner: postgres; Tablespace: 
+-- Name: power_of_attorney_historic_index_on_rowidentifier; Type: INDEX; Schema: source; Owner: postgres
 --
 
 CREATE INDEX power_of_attorney_historic_index_on_rowidentifier ON power_of_attorney_historic USING btree (rowidentifier);
 
 
 --
--- Name: power_of_attorney_id_fk31_ind; Type: INDEX; Schema: source; Owner: postgres; Tablespace: 
+-- Name: power_of_attorney_id_fk31_ind; Type: INDEX; Schema: source; Owner: postgres
 --
 
 CREATE INDEX power_of_attorney_id_fk31_ind ON power_of_attorney USING btree (id);
 
 
 --
--- Name: power_of_attorney_index_on_rowidentifier; Type: INDEX; Schema: source; Owner: postgres; Tablespace: 
+-- Name: power_of_attorney_index_on_rowidentifier; Type: INDEX; Schema: source; Owner: postgres
 --
 
 CREATE INDEX power_of_attorney_index_on_rowidentifier ON power_of_attorney USING btree (rowidentifier);
 
 
 --
--- Name: source_archive_id_fk0_ind; Type: INDEX; Schema: source; Owner: postgres; Tablespace: 
+-- Name: source_archive_id_fk0_ind; Type: INDEX; Schema: source; Owner: postgres
 --
 
 CREATE INDEX source_archive_id_fk0_ind ON source USING btree (archive_id);
 
 
 --
--- Name: source_availability_status_code_fk2_ind; Type: INDEX; Schema: source; Owner: postgres; Tablespace: 
+-- Name: source_availability_status_code_fk2_ind; Type: INDEX; Schema: source; Owner: postgres
 --
 
 CREATE INDEX source_availability_status_code_fk2_ind ON source USING btree (availability_status_code);
 
 
 --
--- Name: source_historic_index_on_rowidentifier; Type: INDEX; Schema: source; Owner: postgres; Tablespace: 
+-- Name: source_historic_index_on_rowidentifier; Type: INDEX; Schema: source; Owner: postgres
 --
 
 CREATE INDEX source_historic_index_on_rowidentifier ON source_historic USING btree (rowidentifier);
 
 
 --
--- Name: source_index_on_rowidentifier; Type: INDEX; Schema: source; Owner: postgres; Tablespace: 
+-- Name: source_index_on_rowidentifier; Type: INDEX; Schema: source; Owner: postgres
 --
 
 CREATE INDEX source_index_on_rowidentifier ON source USING btree (rowidentifier);
 
 
 --
--- Name: source_maintype_fk1_ind; Type: INDEX; Schema: source; Owner: postgres; Tablespace: 
+-- Name: source_maintype_fk1_ind; Type: INDEX; Schema: source; Owner: postgres
 --
 
 CREATE INDEX source_maintype_fk1_ind ON source USING btree (maintype);
 
 
 --
--- Name: source_status_code_fk4_ind; Type: INDEX; Schema: source; Owner: postgres; Tablespace: 
+-- Name: source_status_code_fk4_ind; Type: INDEX; Schema: source; Owner: postgres
 --
 
 CREATE INDEX source_status_code_fk4_ind ON source USING btree (status_code);
 
 
 --
--- Name: source_transaction_id_fk5_ind; Type: INDEX; Schema: source; Owner: postgres; Tablespace: 
+-- Name: source_transaction_id_fk5_ind; Type: INDEX; Schema: source; Owner: postgres
 --
 
 CREATE INDEX source_transaction_id_fk5_ind ON source USING btree (transaction_id);
 
 
 --
--- Name: source_type_code_fk3_ind; Type: INDEX; Schema: source; Owner: postgres; Tablespace: 
+-- Name: source_type_code_fk3_ind; Type: INDEX; Schema: source; Owner: postgres
 --
 
 CREATE INDEX source_type_code_fk3_ind ON source USING btree (type_code);
 
 
 --
--- Name: spatial_source_historic_index_on_rowidentifier; Type: INDEX; Schema: source; Owner: postgres; Tablespace: 
+-- Name: spatial_source_historic_index_on_rowidentifier; Type: INDEX; Schema: source; Owner: postgres
 --
 
 CREATE INDEX spatial_source_historic_index_on_rowidentifier ON spatial_source_historic USING btree (rowidentifier);
 
 
 --
--- Name: spatial_source_id_fk28_ind; Type: INDEX; Schema: source; Owner: postgres; Tablespace: 
+-- Name: spatial_source_id_fk28_ind; Type: INDEX; Schema: source; Owner: postgres
 --
 
 CREATE INDEX spatial_source_id_fk28_ind ON spatial_source USING btree (id);
 
 
 --
--- Name: spatial_source_index_on_rowidentifier; Type: INDEX; Schema: source; Owner: postgres; Tablespace: 
+-- Name: spatial_source_index_on_rowidentifier; Type: INDEX; Schema: source; Owner: postgres
 --
 
 CREATE INDEX spatial_source_index_on_rowidentifier ON spatial_source USING btree (rowidentifier);
 
 
 --
--- Name: spatial_source_measurement_historic_index_on_rowidentifier; Type: INDEX; Schema: source; Owner: postgres; Tablespace: 
+-- Name: spatial_source_measurement_historic_index_on_rowidentifier; Type: INDEX; Schema: source; Owner: postgres
 --
 
 CREATE INDEX spatial_source_measurement_historic_index_on_rowidentifier ON spatial_source_measurement_historic USING btree (rowidentifier);
 
 
 --
--- Name: spatial_source_measurement_index_on_rowidentifier; Type: INDEX; Schema: source; Owner: postgres; Tablespace: 
+-- Name: spatial_source_measurement_index_on_rowidentifier; Type: INDEX; Schema: source; Owner: postgres
 --
 
 CREATE INDEX spatial_source_measurement_index_on_rowidentifier ON spatial_source_measurement USING btree (rowidentifier);
 
 
 --
--- Name: spatial_source_measurement_spatial_source_id_fk30_ind; Type: INDEX; Schema: source; Owner: postgres; Tablespace: 
+-- Name: spatial_source_measurement_spatial_source_id_fk30_ind; Type: INDEX; Schema: source; Owner: postgres
 --
 
 CREATE INDEX spatial_source_measurement_spatial_source_id_fk30_ind ON spatial_source_measurement USING btree (spatial_source_id);
 
 
 --
--- Name: spatial_source_type_code_fk29_ind; Type: INDEX; Schema: source; Owner: postgres; Tablespace: 
+-- Name: spatial_source_type_code_fk29_ind; Type: INDEX; Schema: source; Owner: postgres
 --
 
 CREATE INDEX spatial_source_type_code_fk29_ind ON spatial_source USING btree (type_code);
@@ -17252,182 +17648,182 @@ CREATE INDEX spatial_source_type_code_fk29_ind ON spatial_source USING btree (ty
 SET search_path = system, pg_catalog;
 
 --
--- Name: approle_appgroup_appgroup_id_fk118_ind; Type: INDEX; Schema: system; Owner: postgres; Tablespace: 
+-- Name: approle_appgroup_appgroup_id_fk118_ind; Type: INDEX; Schema: system; Owner: postgres
 --
 
 CREATE INDEX approle_appgroup_appgroup_id_fk118_ind ON approle_appgroup USING btree (appgroup_id);
 
 
 --
--- Name: approle_appgroup_approle_code_fk117_ind; Type: INDEX; Schema: system; Owner: postgres; Tablespace: 
+-- Name: approle_appgroup_approle_code_fk117_ind; Type: INDEX; Schema: system; Owner: postgres
 --
 
 CREATE INDEX approle_appgroup_approle_code_fk117_ind ON approle_appgroup USING btree (approle_code);
 
 
 --
--- Name: approle_appgroup_historic_index_on_rowidentifier; Type: INDEX; Schema: system; Owner: postgres; Tablespace: 
+-- Name: approle_appgroup_historic_index_on_rowidentifier; Type: INDEX; Schema: system; Owner: postgres
 --
 
 CREATE INDEX approle_appgroup_historic_index_on_rowidentifier ON approle_appgroup_historic USING btree (rowidentifier);
 
 
 --
--- Name: appuser_appgroup_appgroup_id_fk120_ind; Type: INDEX; Schema: system; Owner: postgres; Tablespace: 
+-- Name: appuser_appgroup_appgroup_id_fk120_ind; Type: INDEX; Schema: system; Owner: postgres
 --
 
 CREATE INDEX appuser_appgroup_appgroup_id_fk120_ind ON appuser_appgroup USING btree (appgroup_id);
 
 
 --
--- Name: appuser_appgroup_appuser_id_fk119_ind; Type: INDEX; Schema: system; Owner: postgres; Tablespace: 
+-- Name: appuser_appgroup_appuser_id_fk119_ind; Type: INDEX; Schema: system; Owner: postgres
 --
 
 CREATE INDEX appuser_appgroup_appuser_id_fk119_ind ON appuser_appgroup USING btree (appuser_id);
 
 
 --
--- Name: appuser_appgroup_historic_index_on_rowidentifier; Type: INDEX; Schema: system; Owner: postgres; Tablespace: 
+-- Name: appuser_appgroup_historic_index_on_rowidentifier; Type: INDEX; Schema: system; Owner: postgres
 --
 
 CREATE INDEX appuser_appgroup_historic_index_on_rowidentifier ON appuser_appgroup_historic USING btree (rowidentifier);
 
 
 --
--- Name: appuser_historic_index_on_rowidentifier; Type: INDEX; Schema: system; Owner: postgres; Tablespace: 
+-- Name: appuser_historic_index_on_rowidentifier; Type: INDEX; Schema: system; Owner: postgres
 --
 
 CREATE INDEX appuser_historic_index_on_rowidentifier ON appuser_historic USING btree (rowidentifier);
 
 
 --
--- Name: appuser_index_on_rowidentifier; Type: INDEX; Schema: system; Owner: postgres; Tablespace: 
+-- Name: appuser_index_on_rowidentifier; Type: INDEX; Schema: system; Owner: postgres
 --
 
 CREATE INDEX appuser_index_on_rowidentifier ON appuser USING btree (rowidentifier);
 
 
 --
--- Name: appuser_setting_user_id_fk103_ind; Type: INDEX; Schema: system; Owner: postgres; Tablespace: 
+-- Name: appuser_setting_user_id_fk103_ind; Type: INDEX; Schema: system; Owner: postgres
 --
 
 CREATE INDEX appuser_setting_user_id_fk103_ind ON appuser_setting USING btree (user_id);
 
 
 --
--- Name: br_definition_br_id_fk116_ind; Type: INDEX; Schema: system; Owner: postgres; Tablespace: 
+-- Name: br_definition_br_id_fk116_ind; Type: INDEX; Schema: system; Owner: postgres
 --
 
 CREATE INDEX br_definition_br_id_fk116_ind ON br_definition USING btree (br_id);
 
 
 --
--- Name: br_technical_type_code_fk107_ind; Type: INDEX; Schema: system; Owner: postgres; Tablespace: 
+-- Name: br_technical_type_code_fk107_ind; Type: INDEX; Schema: system; Owner: postgres
 --
 
 CREATE INDEX br_technical_type_code_fk107_ind ON br USING btree (technical_type_code);
 
 
 --
--- Name: br_validation_br_id_fk108_ind; Type: INDEX; Schema: system; Owner: postgres; Tablespace: 
+-- Name: br_validation_br_id_fk108_ind; Type: INDEX; Schema: system; Owner: postgres
 --
 
 CREATE INDEX br_validation_br_id_fk108_ind ON br_validation USING btree (br_id);
 
 
 --
--- Name: br_validation_severity_code_fk109_ind; Type: INDEX; Schema: system; Owner: postgres; Tablespace: 
+-- Name: br_validation_severity_code_fk109_ind; Type: INDEX; Schema: system; Owner: postgres
 --
 
 CREATE INDEX br_validation_severity_code_fk109_ind ON br_validation USING btree (severity_code);
 
 
 --
--- Name: br_validation_target_application_moment_fk113_ind; Type: INDEX; Schema: system; Owner: postgres; Tablespace: 
+-- Name: br_validation_target_application_moment_fk113_ind; Type: INDEX; Schema: system; Owner: postgres
 --
 
 CREATE INDEX br_validation_target_application_moment_fk113_ind ON br_validation USING btree (target_application_moment);
 
 
 --
--- Name: br_validation_target_code_fk110_ind; Type: INDEX; Schema: system; Owner: postgres; Tablespace: 
+-- Name: br_validation_target_code_fk110_ind; Type: INDEX; Schema: system; Owner: postgres
 --
 
 CREATE INDEX br_validation_target_code_fk110_ind ON br_validation USING btree (target_code);
 
 
 --
--- Name: br_validation_target_reg_moment_fk115_ind; Type: INDEX; Schema: system; Owner: postgres; Tablespace: 
+-- Name: br_validation_target_reg_moment_fk115_ind; Type: INDEX; Schema: system; Owner: postgres
 --
 
 CREATE INDEX br_validation_target_reg_moment_fk115_ind ON br_validation USING btree (target_reg_moment);
 
 
 --
--- Name: br_validation_target_request_type_code_fk111_ind; Type: INDEX; Schema: system; Owner: postgres; Tablespace: 
+-- Name: br_validation_target_request_type_code_fk111_ind; Type: INDEX; Schema: system; Owner: postgres
 --
 
 CREATE INDEX br_validation_target_request_type_code_fk111_ind ON br_validation USING btree (target_request_type_code);
 
 
 --
--- Name: br_validation_target_rrr_type_code_fk112_ind; Type: INDEX; Schema: system; Owner: postgres; Tablespace: 
+-- Name: br_validation_target_rrr_type_code_fk112_ind; Type: INDEX; Schema: system; Owner: postgres
 --
 
 CREATE INDEX br_validation_target_rrr_type_code_fk112_ind ON br_validation USING btree (target_rrr_type_code);
 
 
 --
--- Name: br_validation_target_service_moment_fk114_ind; Type: INDEX; Schema: system; Owner: postgres; Tablespace: 
+-- Name: br_validation_target_service_moment_fk114_ind; Type: INDEX; Schema: system; Owner: postgres
 --
 
 CREATE INDEX br_validation_target_service_moment_fk114_ind ON br_validation USING btree (target_service_moment);
 
 
 --
--- Name: config_map_layer_metadata_name_fk_ind; Type: INDEX; Schema: system; Owner: postgres; Tablespace: 
+-- Name: config_map_layer_metadata_name_fk_ind; Type: INDEX; Schema: system; Owner: postgres
 --
 
 CREATE INDEX config_map_layer_metadata_name_fk_ind ON config_map_layer_metadata USING btree (name);
 
 
 --
--- Name: config_map_layer_pojo_query_name_fk105_ind; Type: INDEX; Schema: system; Owner: postgres; Tablespace: 
+-- Name: config_map_layer_pojo_query_name_fk105_ind; Type: INDEX; Schema: system; Owner: postgres
 --
 
 CREATE INDEX config_map_layer_pojo_query_name_fk105_ind ON config_map_layer USING btree (pojo_query_name);
 
 
 --
--- Name: config_map_layer_pojo_query_name_for_select_fk106_ind; Type: INDEX; Schema: system; Owner: postgres; Tablespace: 
+-- Name: config_map_layer_pojo_query_name_for_select_fk106_ind; Type: INDEX; Schema: system; Owner: postgres
 --
 
 CREATE INDEX config_map_layer_pojo_query_name_for_select_fk106_ind ON config_map_layer USING btree (pojo_query_name_for_select);
 
 
 --
--- Name: config_map_layer_type_code_fk104_ind; Type: INDEX; Schema: system; Owner: postgres; Tablespace: 
+-- Name: config_map_layer_type_code_fk104_ind; Type: INDEX; Schema: system; Owner: postgres
 --
 
 CREATE INDEX config_map_layer_type_code_fk104_ind ON config_map_layer USING btree (type_code);
 
 
 --
--- Name: config_panel_launcher_launch_group_fkey_ind; Type: INDEX; Schema: system; Owner: postgres; Tablespace: 
+-- Name: config_panel_launcher_launch_group_fkey_ind; Type: INDEX; Schema: system; Owner: postgres
 --
 
 CREATE INDEX config_panel_launcher_launch_group_fkey_ind ON config_panel_launcher USING btree (launch_group);
 
 
 --
--- Name: map_search_option_query_name_fk122_ind; Type: INDEX; Schema: system; Owner: postgres; Tablespace: 
+-- Name: map_search_option_query_name_fk122_ind; Type: INDEX; Schema: system; Owner: postgres
 --
 
 CREATE INDEX map_search_option_query_name_fk122_ind ON map_search_option USING btree (query_name);
 
 
 --
--- Name: query_field_query_name_fk121_ind; Type: INDEX; Schema: system; Owner: postgres; Tablespace: 
+-- Name: query_field_query_name_fk121_ind; Type: INDEX; Schema: system; Owner: postgres
 --
 
 CREATE INDEX query_field_query_name_fk121_ind ON query_field USING btree (query_name);
@@ -17436,56 +17832,56 @@ CREATE INDEX query_field_query_name_fk121_ind ON query_field USING btree (query_
 SET search_path = transaction, pg_catalog;
 
 --
--- Name: transaction_from_service_id_fk6_ind; Type: INDEX; Schema: transaction; Owner: postgres; Tablespace: 
+-- Name: transaction_from_service_id_fk6_ind; Type: INDEX; Schema: transaction; Owner: postgres
 --
 
 CREATE INDEX transaction_from_service_id_fk6_ind ON transaction USING btree (from_service_id);
 
 
 --
--- Name: transaction_historic_index_on_rowidentifier; Type: INDEX; Schema: transaction; Owner: postgres; Tablespace: 
+-- Name: transaction_historic_index_on_rowidentifier; Type: INDEX; Schema: transaction; Owner: postgres
 --
 
 CREATE INDEX transaction_historic_index_on_rowidentifier ON transaction_historic USING btree (rowidentifier);
 
 
 --
--- Name: transaction_index_on_rowidentifier; Type: INDEX; Schema: transaction; Owner: postgres; Tablespace: 
+-- Name: transaction_index_on_rowidentifier; Type: INDEX; Schema: transaction; Owner: postgres
 --
 
 CREATE INDEX transaction_index_on_rowidentifier ON transaction USING btree (rowidentifier);
 
 
 --
--- Name: transaction_source_historic_index_on_rowidentifier; Type: INDEX; Schema: transaction; Owner: postgres; Tablespace: 
+-- Name: transaction_source_historic_index_on_rowidentifier; Type: INDEX; Schema: transaction; Owner: postgres
 --
 
 CREATE INDEX transaction_source_historic_index_on_rowidentifier ON transaction_source_historic USING btree (rowidentifier);
 
 
 --
--- Name: transaction_source_index_on_rowidentifier; Type: INDEX; Schema: transaction; Owner: postgres; Tablespace: 
+-- Name: transaction_source_index_on_rowidentifier; Type: INDEX; Schema: transaction; Owner: postgres
 --
 
 CREATE INDEX transaction_source_index_on_rowidentifier ON transaction_source USING btree (rowidentifier);
 
 
 --
--- Name: transaction_source_source_id_fk101_ind; Type: INDEX; Schema: transaction; Owner: postgres; Tablespace: 
+-- Name: transaction_source_source_id_fk101_ind; Type: INDEX; Schema: transaction; Owner: postgres
 --
 
 CREATE INDEX transaction_source_source_id_fk101_ind ON transaction_source USING btree (source_id);
 
 
 --
--- Name: transaction_source_transaction_id_fk100_ind; Type: INDEX; Schema: transaction; Owner: postgres; Tablespace: 
+-- Name: transaction_source_transaction_id_fk100_ind; Type: INDEX; Schema: transaction; Owner: postgres
 --
 
 CREATE INDEX transaction_source_transaction_id_fk100_ind ON transaction_source USING btree (transaction_id);
 
 
 --
--- Name: transaction_status_code_fk27_ind; Type: INDEX; Schema: transaction; Owner: postgres; Tablespace: 
+-- Name: transaction_status_code_fk27_ind; Type: INDEX; Schema: transaction; Owner: postgres
 --
 
 CREATE INDEX transaction_status_code_fk27_ind ON transaction USING btree (status_code);
@@ -17598,7 +17994,6 @@ CREATE TRIGGER __track_changes BEFORE INSERT OR UPDATE ON source_describes_ba_un
 --
 
 CREATE TRIGGER __track_changes BEFORE INSERT OR UPDATE ON source_describes_rrr FOR EACH ROW EXECUTE PROCEDURE public.f_for_trg_track_changes();
-
 
 
 --
@@ -17737,6 +18132,27 @@ CREATE TRIGGER __track_changes BEFORE INSERT OR UPDATE ON service FOR EACH ROW E
 
 
 --
+-- Name: __track_changes; Type: TRIGGER; Schema: application; Owner: postgres
+--
+
+CREATE TRIGGER __track_changes BEFORE INSERT OR UPDATE ON notify FOR EACH ROW EXECUTE PROCEDURE public.f_for_trg_track_changes();
+
+
+--
+-- Name: __track_changes; Type: TRIGGER; Schema: application; Owner: postgres
+--
+
+CREATE TRIGGER __track_changes BEFORE INSERT OR UPDATE ON notify_property FOR EACH ROW EXECUTE PROCEDURE public.f_for_trg_track_changes();
+
+
+--
+-- Name: __track_changes; Type: TRIGGER; Schema: application; Owner: postgres
+--
+
+CREATE TRIGGER __track_changes BEFORE INSERT OR UPDATE ON notify_uses_source FOR EACH ROW EXECUTE PROCEDURE public.f_for_trg_track_changes();
+
+
+--
 -- Name: __track_history; Type: TRIGGER; Schema: application; Owner: postgres
 --
 
@@ -17771,15 +18187,25 @@ CREATE TRIGGER __track_history AFTER DELETE OR UPDATE ON application_uses_source
 CREATE TRIGGER __track_history AFTER DELETE OR UPDATE ON service FOR EACH ROW EXECUTE PROCEDURE public.f_for_trg_track_history();
 
 
-SET search_path = bulk_operation, pg_catalog;
-
 --
--- Name: __track_changes; Type: TRIGGER; Schema: bulk_operation; Owner: postgres
+-- Name: __track_history; Type: TRIGGER; Schema: application; Owner: postgres
 --
 
-CREATE TRIGGER __track_changes BEFORE INSERT OR UPDATE ON spatial_unit_temporary FOR EACH ROW EXECUTE PROCEDURE public.f_for_trg_track_changes();
+CREATE TRIGGER __track_history AFTER DELETE OR UPDATE ON notify FOR EACH ROW EXECUTE PROCEDURE public.f_for_trg_track_history();
 
 
+--
+-- Name: __track_history; Type: TRIGGER; Schema: application; Owner: postgres
+--
+
+CREATE TRIGGER __track_history AFTER DELETE OR UPDATE ON notify_property FOR EACH ROW EXECUTE PROCEDURE public.f_for_trg_track_history();
+
+
+--
+-- Name: __track_history; Type: TRIGGER; Schema: application; Owner: postgres
+--
+
+CREATE TRIGGER __track_history AFTER DELETE OR UPDATE ON notify_uses_source FOR EACH ROW EXECUTE PROCEDURE public.f_for_trg_track_history();
 
 
 SET search_path = cadastre, pg_catalog;
@@ -18613,6 +19039,62 @@ ALTER TABLE ONLY application_uses_source
 
 
 --
+-- Name: notify_party_id_fk; Type: FK CONSTRAINT; Schema: application; Owner: postgres
+--
+
+ALTER TABLE ONLY notify
+    ADD CONSTRAINT notify_party_id_fk FOREIGN KEY (party_id) REFERENCES party.party(id) ON UPDATE CASCADE ON DELETE CASCADE;
+
+
+--
+-- Name: notify_property_ba_unit_id_fk; Type: FK CONSTRAINT; Schema: application; Owner: postgres
+--
+
+ALTER TABLE ONLY notify_property
+    ADD CONSTRAINT notify_property_ba_unit_id_fk FOREIGN KEY (ba_unit_id) REFERENCES administrative.ba_unit(id) ON UPDATE CASCADE ON DELETE CASCADE;
+
+
+--
+-- Name: notify_property_notify_id_fk; Type: FK CONSTRAINT; Schema: application; Owner: postgres
+--
+
+ALTER TABLE ONLY notify_property
+    ADD CONSTRAINT notify_property_notify_id_fk FOREIGN KEY (notify_id) REFERENCES notify(id) ON UPDATE CASCADE ON DELETE CASCADE;
+
+
+--
+-- Name: notify_service_id_fk; Type: FK CONSTRAINT; Schema: application; Owner: postgres
+--
+
+ALTER TABLE ONLY notify
+    ADD CONSTRAINT notify_service_id_fk FOREIGN KEY (service_id) REFERENCES service(id) ON UPDATE CASCADE ON DELETE CASCADE;
+
+
+--
+-- Name: notify_type_code_fk; Type: FK CONSTRAINT; Schema: application; Owner: postgres
+--
+
+ALTER TABLE ONLY notify
+    ADD CONSTRAINT notify_type_code_fk FOREIGN KEY (relationship_type_code) REFERENCES notify_relationship_type(code);
+
+
+--
+-- Name: notify_uses_source_notify_id_fk; Type: FK CONSTRAINT; Schema: application; Owner: postgres
+--
+
+ALTER TABLE ONLY notify_uses_source
+    ADD CONSTRAINT notify_uses_source_notify_id_fk FOREIGN KEY (notify_id) REFERENCES notify(id) ON UPDATE CASCADE ON DELETE CASCADE;
+
+
+--
+-- Name: notify_uses_source_source_id_fk; Type: FK CONSTRAINT; Schema: application; Owner: postgres
+--
+
+ALTER TABLE ONLY notify_uses_source
+    ADD CONSTRAINT notify_uses_source_source_id_fk FOREIGN KEY (source_id) REFERENCES source.source(id) ON UPDATE CASCADE ON DELETE CASCADE;
+
+
+--
 -- Name: request_type_config_panel_launcher_fkey; Type: FK CONSTRAINT; Schema: application; Owner: postgres
 --
 
@@ -18706,27 +19188,6 @@ ALTER TABLE ONLY service
 
 ALTER TABLE ONLY service
     ADD CONSTRAINT service_status_code_fk24 FOREIGN KEY (status_code) REFERENCES service_status_type(code) ON UPDATE CASCADE ON DELETE RESTRICT;
-
-
-
-
-SET search_path = bulk_operation, pg_catalog;
-
---
--- Name: spatial_unit_temporary_cadastre_object_type_code_fk133; Type: FK CONSTRAINT; Schema: bulk_operation; Owner: postgres
---
-
-ALTER TABLE ONLY spatial_unit_temporary
-    ADD CONSTRAINT spatial_unit_temporary_cadastre_object_type_code_fk133 FOREIGN KEY (cadastre_object_type_code) REFERENCES cadastre.cadastre_object_type(code) ON UPDATE CASCADE ON DELETE RESTRICT;
-
-
---
--- Name: spatial_unit_temporary_transaction_id_fk132; Type: FK CONSTRAINT; Schema: bulk_operation; Owner: postgres
---
-
-ALTER TABLE ONLY spatial_unit_temporary
-    ADD CONSTRAINT spatial_unit_temporary_transaction_id_fk132 FOREIGN KEY (transaction_id) REFERENCES transaction.transaction(id) ON UPDATE CASCADE ON DELETE CASCADE;
-
 
 
 SET search_path = cadastre, pg_catalog;
@@ -19361,464 +19822,6 @@ ALTER TABLE ONLY transaction_source
 
 ALTER TABLE ONLY transaction
     ADD CONSTRAINT transaction_status_code_fk27 FOREIGN KEY (status_code) REFERENCES transaction_status_type(code) ON UPDATE CASCADE ON DELETE RESTRICT;
-
-SET search_path = application, pg_catalog;
-
-
--- TABLES  -------------------------------------------------------------------------------------
-
--- Table: application.notify_relationship_type
-
--- DROP TABLE application.notify_relationship_type;
-
-CREATE TABLE application.notify_relationship_type
-(
-  code character varying(20) NOT NULL, -- The code for the relationship type.
-  display_value character varying(250) NOT NULL, -- Displayed value of the relationship type.
-  description text, -- Description of the relationship type.
-  status character(1) NOT NULL, -- Status of the relationship type (c - current, x - no longer valid).
-  CONSTRAINT notify_relationship_type_pkey PRIMARY KEY (code),
-  CONSTRAINT notify_relationship_type_display_value_unique UNIQUE (display_value)
-);
-ALTER TABLE application.notify_relationship_type
-  OWNER TO postgres;
-COMMENT ON TABLE application.notify_relationship_type
-  IS 'Code list identifying the type of relationship a party has with land affected by a job. Used for bulk notification purposes. 
-Tags: SOLA State Land Extension, Reference Table';
-COMMENT ON COLUMN application.notify_relationship_type.code IS 'The code for the relationship type.';
-COMMENT ON COLUMN application.notify_relationship_type.display_value IS 'Displayed value of the relationship type.';
-COMMENT ON COLUMN application.notify_relationship_type.description IS 'Description of the relationship type.';
-COMMENT ON COLUMN application.notify_relationship_type.status IS 'Status of the relationship type (c - current, x - no longer valid).';
-
-
-
-
-
-
--- Table: application.notify
-
--- DROP TABLE application.notify;
-
-CREATE TABLE application.notify
-(
-  id character varying(40) NOT NULL, -- Identifier for the notification.
-  service_id character varying(40) NOT NULL, -- Identifier for the service.
-  party_id character varying(40) NOT NULL, -- Identifier for the party.
-  relationship_type_code character varying(20) NOT NULL DEFAULT 'owner'::character varying, -- The type of relationship between the party and the land affected by the job. One of Owner, Adjoining Owner, Occupier, Adjoining Occupier, Rightholder, Other, etc.
-  description text, -- The description of the party to notify.
-  classification_code character varying(20), -- SOLA State Land Extension: The security classification for this Notification Party. Only users with the security classification (or a higher classification) will be able to view the record. If null, the record is considered unrestricted.
-  redact_code character varying(20), -- SOLA State Land Extension: The redact classification for this Notification Party. Only users with the redact classification (or a higher classification) will be able to view the record with un-redacted fields. If null, the record is considered unrestricted and no redaction to the record will occur unless bulk redaction classifications have been set for fields of the record.
-  rowidentifier character varying(40) NOT NULL DEFAULT  public.uuid_generate_v1(), -- Identifies the all change records for the row in the notify_historic table
-  rowversion integer NOT NULL DEFAULT 0, -- Sequential value indicating the number of times this row has been modified.
-  change_action character(1) NOT NULL DEFAULT 'i'::bpchar, -- Indicates if the last data modification action that occurred to the row was insert (i), update (u) or delete (d).
-  change_user character varying(50), -- The user id of the last person to modify the row.
-  change_time timestamp without time zone NOT NULL DEFAULT now(), -- The date and time the row was last modified.
-  cancel_service_id character varying(40),  -- Identifier for the cancelaation service if requested.
-  status character varying(40) NOT NULL DEFAULT 'c'::character varying, -- status of the notification if still enabled (c) or waiting for cancellation (x).
-  CONSTRAINT notify_pkey PRIMARY KEY (id),
-  CONSTRAINT notify_party_id_fk FOREIGN KEY (party_id)
-      REFERENCES party.party (id) MATCH SIMPLE
-      ON UPDATE CASCADE ON DELETE CASCADE,
-  CONSTRAINT notify_service_id_fk FOREIGN KEY (service_id)
-      REFERENCES application.service (id) MATCH SIMPLE
-      ON UPDATE CASCADE ON DELETE CASCADE,
-  CONSTRAINT notify_type_code_fk FOREIGN KEY (relationship_type_code)
-      REFERENCES application.notify_relationship_type (code) MATCH SIMPLE
-      ON UPDATE NO ACTION ON DELETE NO ACTION
-);
-ALTER TABLE application.notify
-  OWNER TO postgres;
-COMMENT ON TABLE application.notify
-  IS 'Identifies parties to be notified in bulk as well as the relationship the party has with the land affected by the job.
-Tags: SOLA State Land Extension, Change History';
-COMMENT ON COLUMN application.notify.id IS 'Identifier for the notification.';
-COMMENT ON COLUMN application.notify.service_id IS 'Identifier for the service.';
-COMMENT ON COLUMN application.notify.party_id IS 'Identifier for the party.';
-COMMENT ON COLUMN application.notify.relationship_type_code IS 'The type of relationship between the party and the land affected by the job. One of Owner, Adjoining Owner, Occupier, Adjoining Occupier, Rightholder, Other, etc.';
-COMMENT ON COLUMN application.notify.description IS 'The description of the party to notify.';
-COMMENT ON COLUMN application.notify.classification_code IS 'SOLA State Land Extension: The security classification for this Notification Party. Only users with the security classification (or a higher classification) will be able to view the record. If null, the record is considered unrestricted.';
-COMMENT ON COLUMN application.notify.redact_code IS 'SOLA State Land Extension: The redact classification for this Notification Party. Only users with the redact classification (or a higher classification) will be able to view the record with un-redacted fields. If null, the record is considered unrestricted and no redaction to the record will occur unless bulk redaction classifications have been set for fields of the record.';
-COMMENT ON COLUMN application.notify.rowidentifier IS 'Identifies the all change records for the row in the notify_historic table';
-COMMENT ON COLUMN application.notify.rowversion IS 'Sequential value indicating the number of times this row has been modified.';
-COMMENT ON COLUMN application.notify.change_action IS 'Indicates if the last data modification action that occurred to the row was insert (i), update (u) or delete (d).';
-COMMENT ON COLUMN application.notify.change_user IS 'The user id of the last person to modify the row.';
-COMMENT ON COLUMN application.notify.change_time IS 'The date and time the row was last modified.';
-
-
--- Index: application.notify_index_on_party_id
-
--- DROP INDEX application.notify_index_on_party_id;
-
-CREATE INDEX notify_index_on_party_id
-  ON application.notify
-  USING btree
-  (party_id COLLATE pg_catalog."default");
-
--- Index: application.notify_index_on_rowidentifier
-
--- DROP INDEX application.notify_index_on_rowidentifier;
-
-CREATE INDEX notify_index_on_rowidentifier
-  ON application.notify
-  USING btree
-  (rowidentifier COLLATE pg_catalog."default");
-
--- Index: application.notify_index_on_service_id
-
--- DROP INDEX application.notify_index_on_service_id;
-
-CREATE INDEX notify_index_on_service_id
-  ON application.notify
-  USING btree
-  (service_id COLLATE pg_catalog."default");
-
-
--- Trigger: __track_changes on application.notify
-
--- DROP TRIGGER __track_changes ON application.notify;
-
-CREATE TRIGGER __track_changes
-  BEFORE INSERT OR UPDATE
-  ON application.notify
-  FOR EACH ROW
-  EXECUTE PROCEDURE public.f_for_trg_track_changes();
-
--- Trigger: __track_history on application.notify
-
--- DROP TRIGGER __track_history ON application.notify;
-
-CREATE TRIGGER __track_history
-  AFTER UPDATE OR DELETE
-  ON application.notify
-  FOR EACH ROW
-  EXECUTE PROCEDURE public.f_for_trg_track_history();
-
-
-
-
--- Table: application.notify_property
-
--- DROP TABLE application.notify_property;
-
-CREATE TABLE application.notify_property
-(
-  notify_id character varying(40) NOT NULL, -- Identifier for the notification party the record is associated to.
-  ba_unit_id character varying(40) NOT NULL, -- Identifier of the property associated to the objection.
-  rowidentifier character varying(40) NOT NULL DEFAULT  public.uuid_generate_v1(), -- Identifies the all change records for the row in the notify_property_historic table
-  rowversion integer NOT NULL DEFAULT 0, -- Sequential value indicating the number of times this row has been modified.
-  change_action character(1) NOT NULL DEFAULT 'i'::bpchar, -- Indicates if the last data modification action that occurred to the row was insert (i), update (u) or delete (d).
-  change_user character varying(50), -- The user id of the last person to modify the row.
-  change_time timestamp without time zone NOT NULL DEFAULT now(), -- The date and time the row was last modified.
-  cancel_service_id character varying(40),  -- Identifier for the cancelaation service if requested.
-  status character varying(40) NOT NULL DEFAULT 'c'::character varying, -- status of the notification if still enabled (c) or waiting for cancellation (x).
-  CONSTRAINT notifiy_property_pkey PRIMARY KEY (notify_id, ba_unit_id),
-  CONSTRAINT notify_property_ba_unit_id_fk FOREIGN KEY (ba_unit_id)
-      REFERENCES administrative.ba_unit (id) MATCH SIMPLE
-      ON UPDATE CASCADE ON DELETE CASCADE,
-  CONSTRAINT notify_property_notify_id_fk FOREIGN KEY (notify_id)
-      REFERENCES application.notify (id) MATCH SIMPLE
-      ON UPDATE CASCADE ON DELETE CASCADE
-);
-ALTER TABLE application.notify_property
-  OWNER TO postgres;
-COMMENT ON TABLE application.notify_property
-  IS 'Identifies the properties (a.k.a. Ba Units) this notification party is related to. 
-Tags: FLOSS SOLA Extension, Change History';
-COMMENT ON COLUMN application.notify_property.notify_id IS 'Identifier for the notification party the record is associated to.';
-COMMENT ON COLUMN application.notify_property.ba_unit_id IS 'Identifier of the property associated to the objection.';
-COMMENT ON COLUMN application.notify_property.rowidentifier IS 'Identifies the all change records for the row in the notify_property_historic table';
-COMMENT ON COLUMN application.notify_property.rowversion IS 'Sequential value indicating the number of times this row has been modified.';
-COMMENT ON COLUMN application.notify_property.change_action IS 'Indicates if the last data modification action that occurred to the row was insert (i), update (u) or delete (d).';
-COMMENT ON COLUMN application.notify_property.change_user IS 'The user id of the last person to modify the row.';
-COMMENT ON COLUMN application.notify_property.change_time IS 'The date and time the row was last modified.';
-
-
--- Index: application.notify_property_ba_unit_id_fk_ind
-
--- DROP INDEX application.notify_property_ba_unit_id_fk_ind;
-
-CREATE INDEX notify_property_ba_unit_id_fk_ind
-  ON application.notify_property
-  USING btree
-  (ba_unit_id COLLATE pg_catalog."default");
-
--- Index: application.notify_property_index_on_rowidentifier
-
--- DROP INDEX application.notify_property_index_on_rowidentifier;
-
-CREATE INDEX notify_property_index_on_rowidentifier
-  ON application.notify_property
-  USING btree
-  (rowidentifier COLLATE pg_catalog."default");
-
--- Index: application.notify_property_notify_id_fk_ind
-
--- DROP INDEX application.notify_property_notify_id_fk_ind;
-
-CREATE INDEX notify_property_notify_id_fk_ind
-  ON application.notify_property
-  USING btree
-  (notify_id COLLATE pg_catalog."default");
-
-
--- Trigger: __track_changes on application.notify_property
-
--- DROP TRIGGER __track_changes ON application.notify_property;
-
-CREATE TRIGGER __track_changes
-  BEFORE INSERT OR UPDATE
-  ON application.notify_property
-  FOR EACH ROW
-  EXECUTE PROCEDURE public.f_for_trg_track_changes();
-
--- Trigger: __track_history on application.notify_property
-
--- DROP TRIGGER __track_history ON application.notify_property;
-
-CREATE TRIGGER __track_history
-  AFTER UPDATE OR DELETE
-  ON application.notify_property
-  FOR EACH ROW
-  EXECUTE PROCEDURE public.f_for_trg_track_history();
-
--- Table: application.notify_property_historic
-
--- DROP TABLE application.notify_property_historic;
-
-CREATE TABLE application.notify_property_historic
-(
-  notify_id character varying(40),
-  ba_unit_id character varying(40),
-  rowidentifier character varying(40),
-  rowversion integer,
-  change_action character(1),
-  change_user character varying(50),
-  change_time timestamp without time zone,
-  change_time_valid_until timestamp without time zone NOT NULL DEFAULT now(),
-  cancel_service_id character varying(40),  -- Identifier for the cancelaation service if requested.
-  status character varying(40) NOT NULL DEFAULT 'c'::character varying -- status of the notification if still enabled (c) or waiting for cancellation (x)
-);
-ALTER TABLE application.notify_property_historic
-  OWNER TO postgres;
-
--- Index: application.notify_property_historic_index_on_rowidentifier
-
--- DROP INDEX application.notify_property_historic_index_on_rowidentifier;
-
-CREATE INDEX notify_property_historic_index_on_rowidentifier
-  ON application.notify_property_historic
-  USING btree
-  (rowidentifier COLLATE pg_catalog."default");
-
-  
--- Table: application.notify_uses_source
-
--- DROP TABLE application.notify_uses_source;
-
-CREATE TABLE application.notify_uses_source
-(
-  notify_id character varying(40) NOT NULL, -- Identifier for the notification party the record is associated to.
-  source_id character varying(40) NOT NULL, -- Identifier of the source associated to the application.
-  rowidentifier character varying(40) NOT NULL DEFAULT  public.uuid_generate_v1(), -- Identifies the all change records for the row in the objection_uses_source_historic table
-  rowversion integer NOT NULL DEFAULT 0, -- Sequential value indicating the number of times this row has been modified.
-  change_action character(1) NOT NULL DEFAULT 'i'::bpchar, -- Indicates if the last data modification action that occurred to the row was insert (i), update (u) or delete (d).
-  change_user character varying(50), -- The user id of the last person to modify the row.
-  change_time timestamp without time zone NOT NULL DEFAULT now(), -- The date and time the row was last modified.
-  CONSTRAINT notify_uses_source_pkey PRIMARY KEY (notify_id, source_id),
-  CONSTRAINT notify_uses_source_notify_id_fk FOREIGN KEY (notify_id)
-      REFERENCES application.notify (id) MATCH SIMPLE
-      ON UPDATE CASCADE ON DELETE CASCADE,
-  CONSTRAINT notify_uses_source_source_id_fk FOREIGN KEY (source_id)
-      REFERENCES source.source (id) MATCH SIMPLE
-      ON UPDATE CASCADE ON DELETE CASCADE
-);
-ALTER TABLE application.notify_uses_source
-  OWNER TO postgres;
-COMMENT ON TABLE application.notify_uses_source
-  IS 'Links the notification parties to the sources (a.k.a. documents) genreated for the bulk notification. 
-Tags: FLOSS SOLA Extension, Change History';
-COMMENT ON COLUMN application.notify_uses_source.notify_id IS 'Identifier for the notification party the record is associated to.';
-COMMENT ON COLUMN application.notify_uses_source.source_id IS 'Identifier of the source associated to the application.';
-COMMENT ON COLUMN application.notify_uses_source.rowidentifier IS 'Identifies the all change records for the row in the objection_uses_source_historic table';
-COMMENT ON COLUMN application.notify_uses_source.rowversion IS 'Sequential value indicating the number of times this row has been modified.';
-COMMENT ON COLUMN application.notify_uses_source.change_action IS 'Indicates if the last data modification action that occurred to the row was insert (i), update (u) or delete (d).';
-COMMENT ON COLUMN application.notify_uses_source.change_user IS 'The user id of the last person to modify the row.';
-COMMENT ON COLUMN application.notify_uses_source.change_time IS 'The date and time the row was last modified.';
-
-
--- Index: application.notify_uses_source_index_on_rowidentifier
-
--- DROP INDEX application.notify_uses_source_index_on_rowidentifier;
-
-CREATE INDEX notify_uses_source_index_on_rowidentifier
-  ON application.notify_uses_source
-  USING btree
-  (rowidentifier COLLATE pg_catalog."default");
-
--- Index: application.notify_uses_source_notify_id_fk_ind
-
--- DROP INDEX application.notify_uses_source_notify_id_fk_ind;
-
-CREATE INDEX notify_uses_source_notify_id_fk_ind
-  ON application.notify_uses_source
-  USING btree
-  (notify_id COLLATE pg_catalog."default");
-
--- Index: application.notify_uses_source_source_id_fk_ind
-
--- DROP INDEX application.notify_uses_source_source_id_fk_ind;
-
-CREATE INDEX notify_uses_source_source_id_fk_ind
-  ON application.notify_uses_source
-  USING btree
-  (source_id COLLATE pg_catalog."default");
-
-
--- Trigger: __track_changes on application.notify_uses_source
-
--- DROP TRIGGER __track_changes ON application.notify_uses_source;
-
-CREATE TRIGGER __track_changes
-  BEFORE INSERT OR UPDATE
-  ON application.notify_uses_source
-  FOR EACH ROW
-  EXECUTE PROCEDURE public.f_for_trg_track_changes();
-
--- Trigger: __track_history on application.notify_uses_source
-
--- DROP TRIGGER __track_history ON application.notify_uses_source;
-
-CREATE TRIGGER __track_history
-  AFTER UPDATE OR DELETE
-  ON application.notify_uses_source
-  FOR EACH ROW
-  EXECUTE PROCEDURE public.f_for_trg_track_history();
-
-
----- HISTORIC -----
-
--- Table: application.notify_historic
-
--- DROP TABLE application.notify_historic;
-
-CREATE TABLE application.notify_historic
-(
-  id character varying(40),
-  service_id character varying(40),
-  party_id character varying(40),
-  relationship_type_code character varying(20),
-  description text,
-  classification_code character varying(20),
-  redact_code character varying(20),
-  cancel_service_id character varying(40),
-  status character varying(40) NOT NULL DEFAULT 'c'::character varying,
-  rowidentifier character varying(40), 
-  rowversion integer NOT NULL DEFAULT 0,
-  change_action character(1),
-  change_user character varying(50),
-  change_time timestamp without time zone,
-  change_time_valid_until timestamp without time zone NOT NULL DEFAULT now()
-);
-ALTER TABLE application.notify_historic
-  OWNER TO postgres;
-COMMENT ON TABLE application.notify_historic
-  IS 'History table for the application.notify table';
-
--- Index: application.notify_historic_index_on_rowidentifier
-
--- DROP INDEX application.notify_historic_index_on_rowidentifier;
-
-CREATE INDEX notify_historic_index_on_rowidentifier
-  ON application.notify_historic
-  USING btree
-  (rowidentifier COLLATE pg_catalog."default");
-
--- Table: application.notify_uses_source_historic
-
--- DROP TABLE application.notify_uses_source_historic;
-
-CREATE TABLE application.notify_uses_source_historic
-(
-  notify_id character varying(40),
-  source_id character varying(40),
-  rowidentifier character varying(40),
-  rowversion integer,
-  change_action character(1),
-  change_user character varying(50),
-  change_time timestamp without time zone,
-  change_time_valid_until timestamp without time zone NOT NULL DEFAULT now()
-)
-WITH (
-  OIDS=FALSE
-);
-ALTER TABLE application.notify_uses_source_historic
-  OWNER TO postgres;
-
--- Index: application.notify_uses_source_historic_index_on_rowidentifier
-
--- DROP INDEX application.notify_uses_source_historic_index_on_rowidentifier;
-
-CREATE INDEX notify_uses_source_historic_index_on_rowidentifier
-  ON application.notify_uses_source_historic
-  USING btree
-  (rowidentifier COLLATE pg_catalog."default");
-
-
-
-
-
--- View: application.notifiable_party_for_baunit
-
--- DROP VIEW application.notifiable_party_for_baunit;
-
- 
-CREATE OR REPLACE VIEW application.notifiable_party_for_baunit AS 
-SELECT n.party_id, 
-    nt.party_id AS target_party_id, 
-    n.service_id, 
-    s.application_id, 
-    np.cancel_service_id, 
-    n.status, 
-    (bu.name_firstpart::text || '/'::text) || bu.name_lastpart::text AS baunit_name, 
-    n.rowidentifier, n.rowversion, n.change_action, n.change_user, 
-    n.change_time, n.id AS notifyid, nt.id AS notifytargetid
-  FROM application.service s, 
-    administrative.ba_unit bu, 
-    application.notify n, 
-    application.notify nt, 
-    application.notify_property np,
-    administrative.party_for_rrr  pr,
-    administrative.rrr rrr
-  WHERE n.service_id::text = s.id::text AND bu.id::text = np.ba_unit_id::text AND np.notify_id::text = n.id::text AND n.relationship_type_code::text = 'safeguard'::text 
-    AND nt.service_id::text = s.id::text AND nt.relationship_type_code::text = 'owner'::text 
-    AND nt.party_id=pr.party_id  
-    AND pr.rrr_id=rrr.id 
-    AND rrr.ba_unit_id= bu.id ;
-
--- View: application.cancel_notification
-
--- DROP VIEW application.cancel_notification;
-
-CREATE OR REPLACE VIEW application.cancel_notification AS 
- SELECT pp.name AS partyname,
-  pp.last_name AS partylastname, 
-    tpp.name AS targetpartyname, 
-    tpp.last_name AS targetpartylastname, 
-    npbu.party_id, 
-    npbu.target_party_id, 
-    npbu.baunit_name,
-    npbu.service_id, 
-    npbu.cancel_service_id 
-   FROM party.party pp, party.party tpp, 
-    application.notifiable_party_for_baunit npbu, 
-    application.application aa, application.service s
-  WHERE s.application_id::text = aa.id::text 
-  AND s.id::text = npbu.cancel_service_id::text 
-  AND pp.id::text = npbu.party_id::text AND tpp.id::text = npbu.target_party_id::text 
- AND s.request_type_code::text = 'cancelRelationship'::text;
-
-
-
 
 
 --

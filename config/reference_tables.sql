@@ -2,11 +2,16 @@
 -- PostgreSQL database dump
 --
 
+-- Dumped from database version 9.5.3
+-- Dumped by pg_dump version 9.5.5
+
 SET statement_timeout = 0;
+SET lock_timeout = 0;
 SET client_encoding = 'UTF8';
 SET standard_conforming_strings = on;
 SET check_function_bodies = false;
 SET client_min_messages = warning;
+SET row_security = off;
 
 SET search_path = administrative, pg_catalog;
 
@@ -295,26 +300,6 @@ INSERT INTO service_action_type (code, display_value, status_to_set, status, des
 
 
 ALTER TABLE service_action_type ENABLE TRIGGER ALL;
-
-
---
--- Data for Name: notify_relationship_type; Type: TABLE DATA; Schema: application; Owner: postgres
---
-
-ALTER TABLE notify_relationship_type DISABLE TRIGGER ALL;
-
-INSERT INTO notify_relationship_type (code, display_value, description, status) VALUES ('safeguard', 'Notifiable', 'Party to notify has a recognized right or interest to be safeguarded against any action', 'c');
-INSERT INTO notify_relationship_type (code, display_value, description, status) VALUES ('rightHolder', 'Rightholder', 'Party to notify has a recognized right or interest (e.g. easement) over the land affected  by any action', 'c');
-INSERT INTO notify_relationship_type (code, display_value, description, status) VALUES ('owner', 'Owner', 'Party to notify is an owner of land affected by the job', 'c');
-INSERT INTO notify_relationship_type (code, display_value, description, status) VALUES ('other', 'Other', 'Party to notify has a general interest in the land but is not an owner, rightholder, occuiper or tenant of the land affected  by any action', 'c');
-INSERT INTO notify_relationship_type (code, display_value, description, status) VALUES ('occupier', 'Occupier', 'Party to notify is and occupier or tenant of the land affected  by any action', 'c');
-INSERT INTO notify_relationship_type (code, display_value, description, status) VALUES ('adjoiningOwner', 'Adjoining Owner', 'Party to notify is an owner of land adjoining the land affected  by any action', 'c');
-INSERT INTO notify_relationship_type (code, display_value, description, status) VALUES ('adjoiningOccupier', 'Adjoining Occupier', 'Party to notify is an occupier or tenant of land adjoining the land affected by any action', 'c');
-
-
-ALTER TABLE notify_relationship_type ENABLE TRIGGER ALL;
-
-
 
 SET search_path = cadastre, pg_catalog;
 

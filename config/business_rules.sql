@@ -2,11 +2,16 @@
 -- PostgreSQL database dump
 --
 
+-- Dumped from database version 9.5.3
+-- Dumped by pg_dump version 9.5.5
+
 SET statement_timeout = 0;
+SET lock_timeout = 0;
 SET client_encoding = 'UTF8';
 SET standard_conforming_strings = on;
 SET check_function_bodies = false;
 SET client_min_messages = warning;
+SET row_security = off;
 
 SET search_path = system, pg_catalog;
 
@@ -93,6 +98,7 @@ INSERT INTO br (id, display_name, technical_type_code, feedback, description, te
 INSERT INTO br (id, display_name, technical_type_code, feedback, description, technical_description) VALUES ('newtitle-br22-check-different-owners', 'newtitle-br22-check-different-owners', 'sql', 'Owners of new titles should be the same as owners of underlying titles::::Владельцы новых объектов недвижимости должны быть такие же как в родительских объектах.::::المالكون في سند الملكية الجديد يجب ان يكونوا نفس المالكين من السندات السابقة::::Les propriétaires des nouveaux titres doivent être les mêmes que les propriétaires des titres sous-jacents.::::::::::::Os proprietários de novos títulos devem ser os mesmos que os proprietários de títulos subjacentes::::::::新的产权所有者必须与基础产权的所有者相同。', NULL, '#{id}(baunit_id) is requested.
 Check that new title owners are the same as underlying titles owners (Give WARNING if > 0)');
 INSERT INTO br (id, display_name, technical_type_code, feedback, description, technical_description) VALUES ('ba_unit-has-cadastre-object', 'ba_unit-has-cadastre-object', 'sql', 'Title must have an associated parcel (or cadastre object)::::Недвижимость должна иметь земельный участок (или кадастровый объект).::::سند الملكية يجب ان يحتوي على قطعة  او كائن مساحة::::Le titre doit avoir une parcelle associée (ou objet cadastre)::::::::::::Título deve ter uma parcela associada (ou objeto de cadastro)::::::::财产必须具备一个相关地块（或地籍目标）。', NULL, '#{id}(administrative.ba_unit.id) is requested');
+INSERT INTO br (id, display_name, technical_type_code, feedback, description, technical_description) VALUES ('public-display-check-baunit-has-co', 'public-display-check-baunit-has-co', 'sql', 'All property must have an associated cadastre object.::::Все объекты недвижимости должны иметь соответствующие кадастровые объекты.::::جميع الملكيات يجب ان ترتبط بكائن مساحي::::::::::::::::Toda propriedade deve ter um cadastro de objeto associado.::::::::所有的财产都必须有一个相关的地籍目标。', NULL, '#{lastPart}(name_lastpart) is requested');
 INSERT INTO br (id, display_name, technical_type_code, feedback, description, technical_description) VALUES ('source-attach-in-transaction-allowed-type', 'source-attach-in-transaction-allowed-type', 'sql', 'Document to be registered must have an allowable and current source type::::Документы для регистрации должны иметь допустимый тип.::::الوثيقة المراد تسجيلها يجب ان يكون لها نوع مصدر حالي مسموح به::::Le document à enregistrer doit avoir un type de source courant et disponible.::::::::::::Documento a ser registrado deve ter um tipo de fonte admissível e atual::::::::待登记的文件必须有允许的和当前的来源类型。', NULL, '#{id}(source.source.id) is requested. It checks if the source has a type which has the is_for_registration attribute true.');
 INSERT INTO br (id, display_name, technical_type_code, feedback, description, technical_description) VALUES ('application-br4-check-sources-date-not-in-the-future', 'application-br4-check-sources-date-not-in-the-future', 'sql', 'Documents should have dates formalised by source agency that are not in the future.::::Документы должны иметь дату документа меньше текущей.::::تواريخ الوثائق المعتمدة من الوكالة المصدر يجب ان لا تكون في المستقبل::::Les documents doivent avoir des dates formalisées par l''agence source qui ne sont pas dans le future.::::::::::::Os documentos devem ter datas formalizadas pela agência de origem que não estejam no futuro.::::::::文件应由来源机构标注正式日期以显示那不是在未来。', NULL, 'Checks the date of the document as recorded at lodgement (source.recordation) and checks it is not a date in the future');
 INSERT INTO br (id, display_name, technical_type_code, feedback, description, technical_description) VALUES ('area-check-percentage-newareas-oldareas', 'area-check-percentage-newareas-oldareas', 'sql', 'The difference between the total of the new parcels official areas and the total of the old parcels official areas should not be greater than 0.1%::::Разница между общей официальной площадью новых участков и площадью старых участков не должна превышать 0.1%.::::الفرق بين مجموع مساحات  القطع الجديدة الرسمية  ومجموع المساحات السابقة للقطع القديمة يجب ان لا يتجاوز 0.1 %::::La différence entre la superficie totale officielle des nouvelles parcelles et la superficie totale officielle des anciennes parcelles ne doit pas être supérieur à 0.1%.::::::::::::A diferença entre o total das novas áreas das parcelas oficiais e o total das áreas das parcelas oficiais antigas, não deve ser superior a 0,1%::::::::新宗地的登记总面积和旧宗地的总面积之差不应超过 0.1%。', NULL, '');
@@ -118,7 +124,6 @@ INSERT INTO br (id, display_name, technical_type_code, feedback, description, te
  Check new official area - calculated new area / new official area in percentage (Give in WARNING description, percentage & parcel if percentage > 1%)');
 INSERT INTO br (id, display_name, technical_type_code, feedback, description, technical_description) VALUES ('app-title-has-primary-right', 'app-title-has-primary-right', 'sql', 'A single primary right (such as ownership) must be identified whenever a new title record is created::::Единственное право собственности должно быть зарегистрировано для нового объекта недвижимости.::::يجب تحديد حق اساسي وحيد  عند انشاء سند ملكية جديد::::Un unique droit principal (tel que la propriété) doit être identifié lorsqu''un nouveau titre est créé.::::::::::::Um direito fundamental individual (como a propriedade) deve ser identificado sempre que um novo registro do título for criado.::::::::无论新的产权记录是在何时创建的，单一的基本权利(如所有权) 必须明确。', NULL, '#{id}(application.application.id) is requested');
 INSERT INTO br (id, display_name, technical_type_code, feedback, description, technical_description) VALUES ('ba_unit-has-a-valid-primary-right', 'ba_unit-has-a-valid-primary-right', 'sql', 'A title must have a valid primary right::::Недвижимость должна иметь первичное право собственности.::::سند الملكية يجب ان يحتوي على حق اساسي صالح::::Un titre doit avoir un droit principal valide.::::::::::::Um título deve ter um direito primário válido::::::::一项产权必须具有正当的初始权利。', NULL, '#{id}(baunit_id) is requested.');
-INSERT INTO br (id, display_name, technical_type_code, feedback, description, technical_description) VALUES ('public-display-check-baunit-has-co', 'public-display-check-baunit-has-co', 'sql', 'All property must have an associated cadastre object.::::Все объекты недвижимости должны иметь соответствующие кадастровые объекты.::::جميع الملكيات يجب ان ترتبط بكائن مساحي::::::::::::::::Toda propriedade deve ter um cadastro de objeto associado.::::::::所有的财产都必须有一个相关的地籍目标。', NULL, '#{lastPart}(name_lastpart) is requested');
 INSERT INTO br (id, display_name, technical_type_code, feedback, description, technical_description) VALUES ('application-approve-cancel-old-titles', 'application-approve-cancel-old-titles', 'sql', 'An application including a new freehold service must also terminate the parent title(s) with a cancel title service.::::Identificati titoli esistenti. Prego terminare i titoli esistenti usando il servizio di Cancellazione Titolo::::الطلب الذي يحتوي على خدمة  تملك حر يجب ان يحتوي على خدمة اخرى تلغي جميع سندات الملكية السابقة::::Une demande incluant un nouveau service de propriété franche doit aussi résilier le(s) titre(s) parent(s) avec un service d''annulation.::::::::::::Um pedido, incluindo um novo serviço do propriedade também deve rescindir o título(s) principal com um serviço de cancelar título.::::::::一项包括新的终身保有服务的申请也必须终止带有取消产权服务的源产权。', NULL, '');
 INSERT INTO br (id, display_name, technical_type_code, feedback, description, technical_description) VALUES ('required-sources-are-present', 'required-sources-are-present', 'sql', 'All documents required for the service ''req_type'' are present.::::Должны присутствовать все документы необходимые для услуги ''req_type'' .::::جميع الوثائق المطلوبة لخدمة  ''req_type''  موجودة::::Tous les documents requis pour le service ''req_type'' sont présents.::::::::::::Todos os documentos necessários para o ''req_type'' estão presentes.::::::::所有需要作为服务“请求_类型”的文件都要呈现。', NULL, 'Checks that all required documents for any of the services in an application are recorded. Null value is returned if there are no required documents');
 INSERT INTO br (id, display_name, technical_type_code, feedback, description, technical_description) VALUES ('application-br1-check-required-sources-are-present', 'application-br1-check-required-sources-are-present', 'sql', 'All documents required for the services in this application are present.::::Все документы, необходимые для указанных услуг должны присутствовать в заявлении.::::جميع الوثائق المطلوبة للخدمة  موجودة::::Tous les documents requis pour les services de cette demande sont présents.::::::::::::Todos os documentos necessários para os serviços nesta aplicação estão presentes.::::::::申请中需要的所有文件都需要呈上。', NULL, 'Checks that all required documents for any of the services in an application are recorded. Null value is returned if there are no required documents');
@@ -141,6 +146,7 @@ INSERT INTO br (id, display_name, technical_type_code, feedback, description, te
 INSERT INTO br (id, display_name, technical_type_code, feedback, description, technical_description) VALUES ('cancel-obscuration-request', 'cancel-obscuration-request', 'sql', 'cancel-obscuration-request::::...::::...::::...::::...::::...::::...::::...::::...', NULL, '#{id}(service_id) is requested');
 INSERT INTO br (id, display_name, technical_type_code, feedback, description, technical_description) VALUES ('cancel-relation-notification', 'cancel-relation-notification', 'sql', 'Cancel notification for the services of the application', NULL, '#{id}(application_id) is requested');
 INSERT INTO br (id, display_name, technical_type_code, feedback, description, technical_description) VALUES ('delete-relation-notification', 'delete-relation-notification', 'sql', 'Delete notification for the services of the application', NULL, '#{id}(application_id) is requested');
+
 
 ALTER TABLE br ENABLE TRIGGER ALL;
 
@@ -1030,9 +1036,7 @@ WHERE obscure_service_id  = #{id}
 ;
 select 0=0 as vl
 ');
-insert into system.br_definition(br_id, active_from, active_until, body) 
-values('cancel-relation-notification', now(), 'infinity', 
- 'UPDATE application.notify_property
+INSERT INTO br_definition (br_id, active_from, active_until, body) VALUES ('cancel-relation-notification', '2017-01-20', 'infinity', 'UPDATE application.notify_property
  set status = ''x''
 WHERE cancel_service_id in
 (
@@ -1062,10 +1066,7 @@ WHERE 	      s.application_id::text = aa.id::text
 ;
 select 0=0 as vl
 ');
-
-insert into system.br_definition(br_id, active_from, active_until, body) 
-values('delete-relation-notification', now(), 'infinity', 
- 'DELETE from application.notify
+INSERT INTO br_definition (br_id, active_from, active_until, body) VALUES ('delete-relation-notification', '2017-01-20', 'infinity', 'DELETE from application.notify
 WHERE 
 service_id in (
 SELECT        npbu.service_id
@@ -1187,7 +1188,7 @@ INSERT INTO br_validation (id, br_id, target_code, target_application_moment, ta
 INSERT INTO br_validation (id, br_id, target_code, target_application_moment, target_service_moment, target_reg_moment, target_request_type_code, target_rrr_type_code, severity_code, order_of_execution) VALUES ('consolidation-not-again', 'consolidation-not-again', 'consolidation', NULL, NULL, NULL, NULL, NULL, 'critical', 1);
 INSERT INTO br_validation (id, br_id, target_code, target_application_moment, target_service_moment, target_reg_moment, target_request_type_code, target_rrr_type_code, severity_code, order_of_execution) VALUES ('bfc0ec2c-99dd-11e3-bc3f-13923fd8d236', 'spatial-unit-group-inside-other-spatial-unit-group', 'spatial_unit_group', NULL, NULL, NULL, NULL, NULL, 'medium', 2);
 INSERT INTO br_validation (id, br_id, target_code, target_application_moment, target_service_moment, target_reg_moment, target_request_type_code, target_rrr_type_code, severity_code, order_of_execution) VALUES ('cancel-relation-notification', 'cancel-relation-notification', 'application', 'approve', NULL, NULL, NULL, NULL, 'warning', 300);
-INSERT INTO br_validation (id, br_id, target_code, target_application_moment, target_service_moment, target_reg_moment, target_request_type_code, target_rrr_type_code, severity_code, order_of_execution) VALUES ('delete-relation-notification', 'delete-relation-notification','application', 'archive',  NULL, NULL, NULL, NULL, 'warning', 300);  
+INSERT INTO br_validation (id, br_id, target_code, target_application_moment, target_service_moment, target_reg_moment, target_request_type_code, target_rrr_type_code, severity_code, order_of_execution) VALUES ('delete-relation-notification', 'delete-relation-notification', 'application', 'archive', NULL, NULL, NULL, NULL, 'warning', 300);
 
 
 ALTER TABLE br_validation ENABLE TRIGGER ALL;
